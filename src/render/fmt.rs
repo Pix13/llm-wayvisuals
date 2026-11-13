@@ -105,7 +105,9 @@ pub fn short_gpu_name(n: &str) -> String {
     }
     // trailing " 32GB" / "-32GB"
     let t = n.trim_end();
-    if t.len() > 2 && t[t.len() - 2..].eq_ignore_ascii_case("gb") {
+    // Byte-wise: "gb" is ASCII, so a match also proves len - 2 is a char
+    // boundary (a name ending in a multi-byte char must not panic).
+    if t.len() > 2 && t.as_bytes()[t.len() - 2..].eq_ignore_ascii_case(b"gb") {
         let body = &t[..t.len() - 2];
         let digits = body.chars().rev().take_while(|c| c.is_ascii_digit()).count();
         if digits > 0 {
@@ -182,6 +184,11 @@ mod tests {
         assert_eq!(pct(Some(97.4)), "97%");
         assert_eq!(short_gpu_name("NVIDIA GeForce RTX 3090"), "RTX 3090");
         assert_eq!(short_gpu_name("Tesla V100-PCIE-32GB"), "Tesla V100");
+        // Multi-byte endings must not panic.
+        assert_eq!(short_gpu_name("Carte é"), "Carte é");
+        assert_eq!(short_gpu_name("GPU 32Gé"), "GPU 32Gé");
+        assert_eq!(short_gpu_name("éé"), "éé");
+        assert_eq!(short_gpu_name("€"), "€");
         assert_eq!(short_gpu_name("NVIDIA A100-SXM4-80GB"), "A100");
         assert_eq!(short_gpu_name("NVIDIA RTX A6000"), "RTX A6000");
         assert_eq!(short_gpu_name("AMD Radeon RX 7900 XTX"), "Radeon RX 7900 XTX".replace("Radeon", "AMD Radeon"));
