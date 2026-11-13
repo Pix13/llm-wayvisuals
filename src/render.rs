@@ -188,8 +188,8 @@ impl Renderer {
 
     /// Right part of the title bar: `QUANT · HOST` (`--` when absent).
     fn title_right(&self, view: &PanelView, d: &scene::Data) -> Option<String> {
-        let q = d.model.and_then(|m| m.display_quant()).map_or(fmt::NONE.to_string(), |q| q.to_uppercase());
-        let h = view.snapshot.and_then(|s| s.host.as_deref()).filter(|h| !h.is_empty()).map_or(fmt::NONE.to_string(), |h| h.to_uppercase());
+        let q = d.model.and_then(|m| m.display_quant()).map_or(fmt::NONE.to_string(), |q| draw::cap(q).to_uppercase());
+        let h = view.snapshot.and_then(|s| s.host.as_deref()).filter(|h| !h.is_empty()).map_or(fmt::NONE.to_string(), |h| draw::cap(h).to_uppercase());
         Some(format!("{q} · {h}"))
     }
 

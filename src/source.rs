@@ -25,6 +25,26 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const MAX_LINE: u64 = 4 * 1024 * 1024;
+const MAX_FILE: u64 = 4 * 1024 * 1024;
+/// Bound for status, header and chunk-size lines.
+const MAX_HEAD_LINE: u64 = 8 * 1024;
+const MAX_HEADERS: usize = 100;
+
+/// Read one line (without allocating more than `max` bytes). `Ok(None)` on
+/// EOF; an error when the line has no end within `max` bytes.
+fn read_bounded_line<R: BufRead>(r: &mut R, max: u64) -> io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = r.by_ref().take(max).read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') && n as u64 >= max {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad HTTP response"));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad HTTP response"))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceSpec {
@@ -320,7 +340,7 @@ impl Worker {
                 Ok(md) => {
                     let key = (md.mtime(), md.mtime_nsec(), md.len(), md.ino());
                     if last != Some(key) {
-                        match std::fs::read_to_string(path) {
+                        match read_file_capped(path) {
                             Ok(text) => {
                                 last = Some(key);
                                 let ok = self.ingest(&text)
@@ -395,18 +415,22 @@ impl Worker {
         stream.write_all(req.as_bytes()).map_err(|e| io_reason(&e))?;
 
         let mut r = BufReader::new(stream);
-        let mut line = String::new();
-        r.read_line(&mut line).map_err(|e| io_reason(&e))?;
+        let line = read_bounded_line(&mut r, MAX_HEAD_LINE)
+            .map_err(|e| io_reason(&e))?
+            .ok_or("bad HTTP response")?;
         let code: u16 = line
             .split_whitespace()
             .nth(1)
             .and_then(|c| c.parse().ok())
             .ok_or("bad HTTP response")?;
         let mut chunked = false;
+        let mut headers = 0;
         loop {
-            line.clear();
-            let n = r.read_line(&mut line).map_err(|e| io_reason(&e))?;
-            if n == 0 {
+            let line = read_bounded_line(&mut r, MAX_HEAD_LINE)
+                .map_err(|e| io_reason(&e))?
+                .ok_or("bad HTTP response")?;
+            headers += 1;
+            if headers > MAX_HEADERS {
                 return Err("bad HTTP response".into());
             }
             let l = line.trim_end();
@@ -472,6 +496,22 @@ impl Worker {
     }
 }
 
+fn read_file_capped(path: &Path) -> io::Result<String> {
+    let f = std::fs::File::open(path)?;
+    let mut text = String::new();
+    f.take(MAX_FILE + 1).read_to_string(&mut text).map_err(|e| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            io::Error::new(io::ErrorKind::InvalidData, "bad JSON")
+        } else {
+            e
+        }
+    })?;
+    if text.len() as u64 > MAX_FILE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
+    Ok(text)
+}
+
 fn io_reason(e: &io::Error) -> String {
     use io::ErrorKind::*;
     match e.kind() {
@@ -534,10 +574,8 @@ impl<R: BufRead> Chunked<R> {
     }
 
     fn next_chunk(&mut self) -> io::Result<()> {
-        let mut line = String::new();
-        if self.inner.read_line(&mut line)? == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
+        let line = read_bounded_line(&mut self.inner, MAX_HEAD_LINE)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         let size = line.trim().split(';').next().unwrap_or("").trim();
         let size = u64::from_str_radix(size, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
@@ -568,8 +606,7 @@ impl<R: BufRead> Read for Chunked<R> {
         self.remaining -= n as u64;
         if self.remaining == 0 {
             // Chunk data is followed by CRLF.
-            let mut crlf = String::new();
-            self.inner.read_line(&mut crlf)?;
+            read_bounded_line(&mut self.inner, MAX_HEAD_LINE)?;
         }
         Ok(n)
     }
@@ -804,6 +841,87 @@ mod tests {
         // stream closed cleanly by the server -> Down, then reconnects (new snapshots)
         wait_for(&good, "reconnect", |f| f.generation >= 4);
         drop(good);
+    }
+
+    /// One-shot server sending `payload` verbatim after the request head.
+    fn hostile(payload: impl FnOnce(&mut TcpStream) + Send + 'static) -> Source {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let mut c = s.unwrap();
+                let _ = read_head(&c);
+                payload(&mut c);
+                break;
+            }
+        });
+        Source::spawn(SourceSpec::parse(&format!("http://127.0.0.1:{port}"), None).unwrap())
+    }
+
+    #[test]
+    fn http_hostile_inputs_go_down() {
+        let big = "x".repeat(20_000);
+        let b2 = big.clone();
+        let src = hostile(move |c| {
+            let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nX-Big: {b2}\r\n\r\n").as_bytes());
+        });
+        let f = wait_for(&src, "big header", |f| matches!(f.status, LinkStatus::Down(_)));
+        assert_eq!(f.status, LinkStatus::Down("bad HTTP response".into()));
+
+        let src = hostile(|c| {
+            let mut h = String::from("HTTP/1.1 200 OK\r\n");
+            for i in 0..150 {
+                h.push_str(&format!("X-{i}: v\r\n"));
+            }
+            h.push_str("\r\n");
+            let _ = c.write_all(h.as_bytes());
+        });
+        let f = wait_for(&src, "many headers", |f| matches!(f.status, LinkStatus::Down(_)));
+        assert_eq!(f.status, LinkStatus::Down("bad HTTP response".into()));
+
+        let b3 = big.clone();
+        let src = hostile(move |c| {
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            let _ = c.write_all(b3.as_bytes());
+            let _ = c.write_all(b"\r\n");
+        });
+        let f = wait_for(&src, "big chunk line", |f| matches!(f.status, LinkStatus::Down(_)));
+        assert_eq!(f.status, LinkStatus::Down("bad HTTP response".into()));
+        assert!(f.snapshot.is_none());
+
+        // NDJSON line over the cap (no newline): Down, nothing stored.
+        let src = hostile(|c| {
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let chunk = vec![b'a'; 64 * 1024];
+            for _ in 0..(MAX_LINE as usize / chunk.len() + 2) {
+                if c.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let f = wait_for(&src, "long line", |f| {
+            f.status == LinkStatus::Down("line too long".into())
+        });
+        assert!(f.snapshot.is_none());
+    }
+
+    #[test]
+    fn bounded_line_helper_and_file_cap() {
+        let data = vec![b'a'; 100];
+        let mut r = BufReader::new(&data[..]);
+        assert!(read_bounded_line(&mut r, 50).is_err());
+        let mut r = BufReader::new(&b"ok\r\nrest"[..]);
+        assert_eq!(read_bounded_line(&mut r, 50).unwrap().as_deref(), Some("ok\r\n"));
+
+        let dir = tmpdir("cap");
+        let p = dir.join("big.json");
+        std::fs::write(&p, vec![b' '; MAX_FILE as usize + 10]).unwrap();
+        assert!(read_file_capped(&p).is_err());
+        let src = Source::spawn(SourceSpec::File(p));
+        let f = wait_for(&src, "too large", |f| matches!(f.status, LinkStatus::Down(_)));
+        assert_eq!(f.status, LinkStatus::Down("file too large".into()));
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

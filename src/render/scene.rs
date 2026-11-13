@@ -167,7 +167,7 @@ pub fn draw_centre_title(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, titl
         text(pm, &f.label, rs, r.x + r.w - 18.0, r.y + 31.0 * lay.ut, rt, th.dim, 1.0, Align::Right);
         avail -= w + 24.0;
     }
-    let t = clip_text(&f.semi, sz, &title.to_uppercase(), avail, 0.8);
+    let t = clip_text(&f.semi, sz, &cap(title).to_uppercase(), avail, 0.8);
     text(pm, &f.semi, sz, r.x + 18.0, r.y + 31.0 * lay.ut, &t, th.text, 0.8, Align::Left);
 }
 

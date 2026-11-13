@@ -213,7 +213,19 @@ pub fn rect_aa(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color) {
 
 // ---- text --------------------------------------------------------------
 
+/// Hard cap on the characters of any displayed string (server-controlled
+/// text must not make a frame slow). Cuts on a char boundary.
+pub const MAX_CHARS: usize = 256;
+
+pub fn cap(s: &str) -> &str {
+    match s.char_indices().nth(MAX_CHARS) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 pub fn text_width(font: &FontRef, size: f32, s: &str, tracking: f32) -> f32 {
+    let s = cap(s);
     let sc = font.as_scaled(PxScale::from(size));
     let mut w = 0.0;
     let mut prev = None;
@@ -257,6 +269,7 @@ pub fn text(
     tracking: f32,
     align: Align,
 ) -> f32 {
+    let s = cap(s);
     let w = text_width(font, size, s, tracking);
     let x0 = match align {
         Align::Left => x,
@@ -306,18 +319,91 @@ pub fn fit_size(font: &FontRef, size: f32, min: f32, s: &str, max_w: f32, tracki
     }
 }
 
-/// Truncates with an ellipsis so that it fits `max_w`.
+/// Truncates with an ellipsis so that it fits `max_w`. Linear time: glyph
+/// advances are accumulated once (strings are capped at [`MAX_CHARS`]).
 pub fn clip_text(font: &FontRef, size: f32, s: &str, max_w: f32, tracking: f32) -> String {
-    if text_width(font, size, s, tracking) <= max_w {
+    let capped = cap(s);
+    if capped.len() == s.len() && text_width(font, size, capped, tracking) <= max_w {
         return s.to_string();
     }
-    let mut t: String = s.to_string();
-    while !t.is_empty() {
-        t.pop();
-        let c = format!("{t}…");
-        if text_width(font, size, &c, tracking) <= max_w {
-            return c;
+    let sc = font.as_scaled(PxScale::from(size));
+    let ell = sc.glyph_id('…');
+    let ell_adv = sc.h_advance(ell);
+    // (byte offset of the char, width of the prefix before it incl. trailing tracking, its glyph)
+    let mut pre: Vec<(usize, f32, ab_glyph::GlyphId)> = Vec::new();
+    let mut cum = 0.0f32;
+    let mut prev: Option<ab_glyph::GlyphId> = None;
+    for (i, ch) in capped.char_indices() {
+        let g = sc.glyph_id(ch);
+        if let Some(p) = prev {
+            cum += sc.kern(p, g);
+        }
+        pre.push((i, cum, g));
+        cum += sc.h_advance(g) + tracking;
+        prev = Some(g);
+    }
+    // keep the first k chars: width = prefix(k) + kern(last, …) + adv(…)
+    let n = pre.len();
+    let last_k = if capped.len() == s.len() { n.saturating_sub(1) } else { n };
+    for k in (0..=last_k).rev() {
+        let w = if k == 0 {
+            ell_adv
+        } else {
+            let (_, c, g) = pre[k - 1];
+            // pre[k-1].1 is the prefix before char k-1; add that char's own advance
+            c + sc.h_advance(g) + tracking + sc.kern(g, ell) + ell_adv
+        };
+        if w <= max_w {
+            let end = if k == n { capped.len() } else { pre[k].0 };
+            return format!("{}…", &capped[..end]);
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn old_clip(font: &FontRef, size: f32, s: &str, max_w: f32, tracking: f32) -> String {
+        if text_width(font, size, s, tracking) <= max_w {
+            return s.to_string();
+        }
+        let mut t: String = s.to_string();
+        while !t.is_empty() {
+            t.pop();
+            let c = format!("{t}…");
+            if text_width(font, size, &c, tracking) <= max_w {
+                return c;
+            }
+        }
+        String::new()
+    }
+
+    #[test]
+    fn clip_matches_reference_on_normal_strings() {
+        let f = Fonts::load();
+        for s in ["", "A", "DEEPSEEK-V4.1-FLASH / MAYA", "Qwen3-30B-A3B-Instruct-2507 · llama.cpp", "héllo wörld ünïcode"] {
+            for w in [0.0, 5.0, 40.0, 120.0, 300.0, 1000.0] {
+                for tr in [0.0, 0.8] {
+                    assert_eq!(clip_text(&f.semi, 23.0, s, w, tr), old_clip(&f.semi, 23.0, s, w, tr), "{s:?} w={w} tr={tr}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_strings_are_capped_and_fast() {
+        let f = Fonts::load();
+        let big = "é".repeat(1_000_000);
+        let t0 = std::time::Instant::now();
+        let c = clip_text(&f.semi, 23.0, &big, 5000.0, 0.8);
+        let w = text_width(&f.semi, 23.0, &big, 0.8);
+        assert!(c.chars().count() <= MAX_CHARS + 1 && c.ends_with('…'));
+        assert!(w > 0.0);
+        let mut pm = Pixmap::new(64, 64).unwrap();
+        text(&mut pm, &f.semi, 12.0, 0.0, 20.0, &big, Color::WHITE, 0.0, Align::Left);
+        assert!(t0.elapsed().as_millis() < 500, "took {:?}", t0.elapsed());
+        assert_eq!(cap(&big).chars().count(), MAX_CHARS);
+    }
 }
