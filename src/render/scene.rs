@@ -326,7 +326,8 @@ fn info_header(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, t
 
 #[allow(clippy::too_many_arguments)]
 fn info_pair(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, w: f32, y: f32, label: &str, v: &str, c: Color, u: f32) {
-    text(pm, &f.label, px(11.0, u, 10.0), x, y, label, th.dim, 1.2, Align::Left);
+    let label = clip_text(&f.label, px(11.0, u, 10.0), label, w, 1.2);
+    text(pm, &f.label, px(11.0, u, 10.0), x, y, &label, th.dim, 1.2, Align::Left);
     let s = fit_size(&f.semi, px(17.0, u, 14.0), 10.0, v, w, 0.2);
     text(pm, &f.semi, s, x, y + 19.0 * u, v, c, 0.2, Align::Left);
 }
@@ -424,44 +425,70 @@ fn sum_opt<I: Iterator<Item = Option<f64>>>(it: I) -> Option<f64> {
 
 pub fn draw_top_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, d: &Data, t: f32, live: bool) {
     let u = lay.ut;
-    // ---- right: GPU. First GPU of the model prominent, the others as
-    // compact lines in the info column.
+    // ---- right: GPU card = aggregate over the model's GPUs
+    // (mean util / clock, total power / VRAM, max temperatures).
     let r = lay.top(2);
     let gr = gauge_of(r, true, u);
-    let g0 = d.gpus.first().copied();
-    let util = g0.and_then(|g| g.util_pct);
-    let gname = g0.and_then(|g| g.name.as_deref()).map(fmt::short_gpu_name).unwrap_or_else(|| fmt::NONE.into());
-    gauge_dynamic(pm, th, f, gr, util.map(|u| (u / 100.0) as f32), &gname, t, live);
+    let gs = &d.gpus;
+    let mean = |it: &mut dyn Iterator<Item = Option<f64>>| {
+        let v: Vec<f64> = it.flatten().collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let maxv = |it: &mut dyn Iterator<Item = Option<f64>>| it.flatten().fold(None, |a: Option<f64>, v| Some(a.map_or(v, |a| a.max(v))));
+    let util = mean(&mut gs.iter().map(|g| g.util_pct));
+    let names: Vec<Option<&str>> = gs.iter().map(|g| g.name.as_deref()).collect();
+    let group = fmt::gpu_group_label(&names);
+    gauge_dynamic(pm, th, f, gr, util.map(|u| (u / 100.0) as f32), &group, t, live);
     let ur = usage_rect(gr, true);
     text(pm, &f.semi, px(16.0, u, 14.0), ur.x + ur.w / 2.0, ur.y + ur.h * 0.72, &fmt::pct(util), th.value, 0.2, Align::Center);
-    let vram_pct = g0.and_then(|g| match (g.mem_used_mb, g.mem_total_mb) {
-        (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
+    let used = sum_opt(gs.iter().map(|g| g.mem_used_mb.map(|v| v as f64)));
+    let total = sum_opt(gs.iter().map(|g| g.mem_total_mb.map(|v| v as f64)));
+    let vram_pct = match (used, total) {
+        (Some(u), Some(t)) if t > 0.0 => Some(u / t * 100.0),
         _ => None,
-    });
+    };
+    let clock = mean(&mut gs.iter().map(|g| g.clock_sm_mhz.map(|c| c as f64)));
     let bub = [
-        fmt::mhz(g0.and_then(|g| g.clock_sm_mhz)),
-        fmt::watts(g0.and_then(|g| g.power_w)),
-        fmt::gb_from_mb(g0.and_then(|g| g.mem_used_mb)),
+        fmt::mhz(clock.map(|c| c.round() as u32)),
+        fmt::watts(sum_opt(gs.iter().map(|g| g.power_w))),
+        fmt::gb_from_mb(used.map(|v| v as u64)),
     ];
     for (i, v) in bub.iter().enumerate() {
         let b = bubble_rect(gr, i);
         let s = fit_size(&f.semi, px(17.0, u, 14.0), 11.0, v, b.w - 22.0, 0.0);
         text(pm, &f.semi, s, b.x + 14.0, b.y + b.h * 0.81, v, th.value, 0.0, Align::Left);
     }
-    let vals = [fmt::pct(vram_pct), fmt::temp(g0.and_then(|g| g.temp_c)), fmt::temp(g0.and_then(|g| g.mem_temp_c))];
+    let vals = [
+        fmt::pct(vram_pct),
+        fmt::temp(maxv(&mut gs.iter().map(|g| g.temp_c))),
+        fmt::temp(maxv(&mut gs.iter().map(|g| g.mem_temp_c))),
+    ];
     for (i, v) in vals.iter().enumerate() {
         value_box_dynamic(pm, th, f, box_rect(r, true, i, u), v, u);
     }
+    // GPU INFO: one `GPUn · NAME` / `util power temp` pair per GPU (up to 4);
+    // pairs that do not fit are replaced by a "+N more" line.
     let (ix, iw) = right_info(r, gr);
-    info_pair(pm, th, f, ix, iw, r.y + 97.0 * u, "GPU 0", &gname, th.value, u);
-    for (k, g) in d.gpus.iter().skip(1).take(3).enumerate() {
-        let y = r.y + (139.0 + k as f32 * 44.0) * u;
-        if y + 19.0 * u > r.y + r.h - 12.0 {
-            break; // no room: drop the least important compact GPU lines
-        }
-        let lb = format!("GPU {}", g.index.map_or("?".into(), |i| i.to_string()));
+    let shown = gs.len().min(4);
+    let slot = |k: usize| r.y + (97.0 + k as f32 * 42.0) * u;
+    let fits = |k: usize| slot(k) + 19.0 * u <= r.y + r.h - 12.0;
+    let cap = (0..shown).take_while(|k| fits(*k)).count();
+    let hidden = gs.len() - if gs.len() > cap { cap.saturating_sub(1) } else { gs.len() };
+    let drawn = if hidden > 0 { cap.saturating_sub(1) } else { gs.len() };
+    for (k, g) in gs.iter().take(drawn).enumerate() {
+        let idx = g.index.map_or("?".into(), |i| i.to_string());
+        let nm = g.name.as_deref().map(fmt::short_gpu_name).filter(|n| !n.is_empty());
+        let lb = match nm {
+            Some(n) => format!("GPU{idx} · {n}"),
+            None => format!("GPU{idx}"),
+        };
         let v = format!("{} {} {}", fmt::pct(g.util_pct), fmt::watts(g.power_w), fmt::temp(g.temp_c));
-        info_pair(pm, th, f, ix, iw, y, &lb, &v, th.text, u);
+        info_pair(pm, th, f, ix, iw, slot(k), &lb, &v, th.value, u);
+    }
+    if gs.is_empty() {
+        info_pair(pm, th, f, ix, iw, slot(0), "GPU", fmt::NONE, th.value, u);
+    } else if hidden > 0 {
+        text(pm, &f.label, px(12.0, u, 10.5), ix, slot(drawn), &format!("+{hidden} more"), th.dim, 1.0, Align::Left);
     }
 }
 

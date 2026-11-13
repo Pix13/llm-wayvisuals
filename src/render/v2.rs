@@ -19,6 +19,8 @@ fn red() -> Color {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuNode {
     pub index: u32,
+    /// Short display name (`RTX 3090`).
+    pub name: Option<String>,
     /// Memory-controller busy % (`bandwidth.vram[gpu].busy_pct`).
     pub busy_pct: Option<f64>,
     /// Host -> device PCIe MB/s and the link capacity.
@@ -68,6 +70,7 @@ impl PathView {
                 let vram = bw.and_then(|b| b.vram.iter().find(|v| v.gpu == Some(index)));
                 GpuNode {
                     index,
+                    name: g.name.as_deref().map(fmt::short_gpu_name).filter(|n| !n.is_empty()),
                     busy_pct: vram.and_then(|v| v.busy_pct),
                     rx_mb_s: link.and_then(|l| l.rx_mb_s),
                     cap_mb_s: link.and_then(|l| l.cap_mb_s),
@@ -272,9 +275,27 @@ fn gpu_box(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h: f3
     }
     stroke(pm, &body, border, 1.6);
     let lx = x + 8.0;
-    text(pm, &f.semi, px(16.0, u, 12.0), lx, y + 22.0 * u.max(0.6), &format!("GPU{i}"), th.value, 0.6, Align::Left);
-    // fan, spinning with the memory/compute activity
     let fr = (h * 0.28).min(15.0 * u.max(0.7));
+    let ls = px(16.0, u, 12.0);
+    let by_l = y + 22.0 * u.max(0.6);
+    let lb = format!("GPU{i}");
+    let lw = text(pm, &f.semi, ls, lx, by_l, &lb, th.value, 0.6, Align::Left);
+    // short GPU name next to the label, clipped to the room left of the fan
+    if let Some(n) = g.and_then(|g| g.name.as_deref()) {
+        let avail = x + w - fr * 2.0 - 10.0 - (lx + lw + 6.0);
+        let ns = px(11.0, u, 10.0);
+        let mut nm = clip_text(&f.label, ns, &format!("· {n}"), avail, 0.3);
+        if nm.ends_with('…') {
+            let alt = clip_text(&f.label, ns, n, avail, 0.3);
+            if !alt.ends_with('…') {
+                nm = alt; // drop the dot rather than the name
+            }
+        }
+        if avail > 14.0 && nm != "…" && !nm.is_empty() {
+            text(pm, &f.label, ns, lx + lw + 6.0, by_l, &nm, th.dim, 0.3, Align::Left);
+        }
+    }
+    // fan, spinning with the memory/compute activity
     let (fcx, fcy) = (x + w - fr - 8.0, y + h * 0.40);
     fan_rot(pm, fcx, fcy, fr, alpha(if bound { red() } else { th.bright }, 0.85), t * (40.0 + 600.0 * busy.unwrap_or(0.0) as f32 / 100.0));
     // VRAM bar

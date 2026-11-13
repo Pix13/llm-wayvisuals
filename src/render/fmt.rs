@@ -82,12 +82,53 @@ pub fn count(v: Option<u64>) -> String {
     }
 }
 
-/// "NVIDIA GeForce RTX 3090" -> "RTX 3090".
+fn find_ci(s: &str, pat: &str) -> Option<usize> {
+    let (b, p) = (s.as_bytes(), pat.as_bytes());
+    if p.is_empty() || b.len() < p.len() {
+        return None;
+    }
+    (0..=b.len() - p.len()).find(|&i| b[i..i + p.len()].eq_ignore_ascii_case(p) && s.is_char_boundary(i))
+}
+
+/// Short display name of a GPU: strips a leading "NVIDIA " / "GeForce ",
+/// a "-PCIE…" / "-SXM…" suffix and trailing memory sizes ("32GB").
+/// "NVIDIA GeForce RTX 3090" -> "RTX 3090", "Tesla V100-PCIE-32GB" ->
+/// "Tesla V100", "NVIDIA A100-SXM4-80GB" -> "A100". Capped at 256 chars.
 pub fn short_gpu_name(n: &str) -> String {
-    let n = n.trim();
-    let n = n.strip_prefix("NVIDIA ").unwrap_or(n);
-    let n = n.strip_prefix("GeForce ").unwrap_or(n);
-    n.to_string()
+    let mut n = super::draw::cap(n).trim();
+    n = n.strip_prefix("NVIDIA ").unwrap_or(n);
+    n = n.strip_prefix("GeForce ").unwrap_or(n);
+    for pat in ["-pcie", "-sxm"] {
+        if let Some(i) = find_ci(n, pat) {
+            n = &n[..i];
+        }
+    }
+    // trailing " 32GB" / "-32GB"
+    let t = n.trim_end();
+    if t.len() > 2 && t[t.len() - 2..].eq_ignore_ascii_case("gb") {
+        let body = &t[..t.len() - 2];
+        let digits = body.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 {
+            let cut = body.len() - digits;
+            if cut > 0 && matches!(body.as_bytes()[cut - 1], b' ' | b'-') {
+                n = &body[..cut - 1];
+            }
+        }
+    }
+    n.trim().to_string()
+}
+
+/// "2× RTX 3090" for identical GPUs, "2 GPUs" for mixed ones, the bare
+/// name for a single GPU, `--` for none.
+pub fn gpu_group_label(names: &[Option<&str>]) -> String {
+    let short: Vec<String> = names.iter().map(|n| n.map(short_gpu_name).unwrap_or_default()).collect();
+    match short.len() {
+        0 => NONE.into(),
+        1 if short[0].is_empty() => NONE.into(),
+        1 => short[0].clone(),
+        n if !short[0].is_empty() && short.iter().all(|s| *s == short[0]) => format!("{n}× {}", short[0]),
+        n => format!("{n} GPUs"),
+    }
 }
 
 pub fn opt_str(v: Option<&str>) -> String {
@@ -140,5 +181,18 @@ mod tests {
         assert_eq!(pct(Some(0.35)), "0.3%");
         assert_eq!(pct(Some(97.4)), "97%");
         assert_eq!(short_gpu_name("NVIDIA GeForce RTX 3090"), "RTX 3090");
+        assert_eq!(short_gpu_name("Tesla V100-PCIE-32GB"), "Tesla V100");
+        assert_eq!(short_gpu_name("NVIDIA A100-SXM4-80GB"), "A100");
+        assert_eq!(short_gpu_name("NVIDIA RTX A6000"), "RTX A6000");
+        assert_eq!(short_gpu_name("AMD Radeon RX 7900 XTX"), "Radeon RX 7900 XTX".replace("Radeon", "AMD Radeon"));
+        assert_eq!(short_gpu_name("Apple M3 Max"), "Apple M3 Max");
+        assert_eq!(short_gpu_name("Tesla V100-32GB"), "Tesla V100");
+        assert_eq!(short_gpu_name("Quadro RTX 8000 48GB"), "Quadro RTX 8000");
+        assert_eq!(short_gpu_name("NVIDIA GeForce RTX 4090 D"), "RTX 4090 D");
+        assert_eq!(short_gpu_name(&"é".repeat(1000)).chars().count(), 256);
+        assert_eq!(gpu_group_label(&[Some("NVIDIA GeForce RTX 3090"), Some("NVIDIA GeForce RTX 3090")]), "2× RTX 3090");
+        assert_eq!(gpu_group_label(&[Some("NVIDIA GeForce RTX 3090"), Some("Tesla V100-PCIE-32GB")]), "2 GPUs");
+        assert_eq!(gpu_group_label(&[Some("NVIDIA A100-SXM4-80GB")]), "A100");
+        assert_eq!(gpu_group_label(&[]), "--");
     }
 }
