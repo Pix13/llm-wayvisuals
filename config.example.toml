@@ -1,0 +1,43 @@
+# llm-wayvisuals configuration.
+# Default location: $XDG_CONFIG_HOME/llm-wayvisuals/config.toml
+# (usually ~/.config/llm-wayvisuals/config.toml).
+# 1 to 3 [[panel]] entries. Unknown keys are an error.
+# Panels are grouped into surfaces by `output`: panels without `output` share one
+# surface (one window, or the first free monitor) and are stacked vertically;
+# panels with the same `output` share that monitor; different outputs give
+# different surfaces (one panel per screen).
+
+[[panel]]
+# Output name (connector, e.g. "DP-2"; see --list-outputs). Omit for "first free output".
+# Prefer names to indexes: indexes differ between Wayland and X11.
+output = "DP-2"
+
+# Where the llm-visuals stats come from. One of:
+#   "/run/user/1000/llmv-0.json"            JSON file (llm-visuals --export-json)
+#   "unix:///run/user/1000/llmv-0.sock"     Unix socket, NDJSON (--export-sock)
+#   "http://gpubox1.example.lan:9464"              HTTP stream (--export-listen), path defaults to /stream
+# https:// is not supported: use "ssh -L" or a VPN and point to http://127.0.0.1:PORT.
+source = "/run/user/1000/llmv-0.json"
+
+# Optional, http sources only: file holding the Bearer token (read and trimmed at load).
+# Keep it at mode 0600, otherwise a warning is printed.
+# token_file = "~/.config/llm-wayvisuals/gpubox1.token"
+
+# Which model to show: "auto" (first busy model, else first), a pid number,
+# or a case-insensitive part of the model name.
+model = "auto"
+
+# Colour theme: "green", "gold", "purple" or "blue" (red is reserved for bottlenecks).
+# Default by panel position: green, blue, purple.
+theme = "green"
+
+# Optional: panel name (default "panel-N") and an override for the centre card title.
+# name = "local"
+# title = "QWEN3"
+
+# [[panel]]
+# output = "DP-3"
+# source = "http://gpubox1.example.lan:9464"
+# token_file = "~/.config/llm-wayvisuals/gpubox1.token"
+# model = "deepseek"
+# theme = "blue"

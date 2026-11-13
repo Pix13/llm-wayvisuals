@@ -1,0 +1,80 @@
+{
+ "schema": "llm-visuals.stats/1",
+ "seq": 190,
+ "ts": 1794554762.1758504,
+ "host": "gpubox1",
+ "source": "live",
+ "exporter_pid": 4023975,
+ "models": [
+  {
+   "pid": 0,
+   "name": "deepseek-v4.1-flash",
+   "engine": "maya",
+   "quant": null,
+   "phase": "decode",
+   "decode_tps": 87.4,
+   "prefill_tps": 2310.0,
+   "peak_decode_tps": 53.76,
+   "peak_prefill_tps": 39.2,
+   "ctx_used": 41000,
+   "ctx_max": 524288,
+   "session_decoded": 108,
+   "session_prefilled": 225,
+   "requests_finished": 42,
+   "gpu_indices": [],
+   "current_request": {
+    "prompt_tokens": 225,
+    "cached_tokens": 0,
+    "decoded": 108,
+    "ttft_s": 6.03,
+    "elapsed_s": 8.69
+   },
+   "last_request": {
+    "prompt_tokens": 1830,
+    "cached_tokens": 512,
+    "decoded": 400,
+    "ttft_s": 0.41,
+    "duration_s": 5.2,
+    "avg_prefill_tps": 2250.0,
+    "avg_decode_tps": 85.1,
+    "peak_decode_tps": 91.0
+   }
+  }
+ ],
+ "gpus": [
+  {
+   "index": 0,
+   "name": "NVIDIA GeForce RTX 3090",
+   "util_pct": 48.0,
+   "mem_used_mb": 23899,
+   "mem_total_mb": 24576,
+   "power_w": 191.61,
+   "power_max_w": 250.0,
+   "temp_c": 52.0,
+   "mem_temp_c": null,
+   "temp_limit_c": 93.0,
+   "clock_sm_mhz": 1890,
+   "clock_mem_mhz": 10001,
+   "fan_pct": 0.0,
+   "fan_rpm": null,
+   "unified": false
+  },
+  {
+   "index": 1,
+   "name": "NVIDIA GeForce RTX 3090",
+   "util_pct": 66.0,
+   "mem_used_mb": 23881,
+   "mem_total_mb": 24576,
+   "power_w": 214.33,
+   "power_max_w": 250.0,
+   "temp_c": 41.0,
+   "mem_temp_c": null,
+   "temp_limit_c": 93.0,
+   "clock_sm_mhz": 1935,
+   "clock_mem_mhz": 10001,
+   "fan_pct": 0.0,
+   "fan_rpm": null,
+   "unified": false
+  }
+ ]
+}
