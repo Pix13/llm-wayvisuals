@@ -413,7 +413,7 @@ mod stack_tests {
         pm
     }
 
-    /// Writes v2-{A..E}.png, gpubox1 and 3-band/2-band stacks to $WAYVIS_OUT.
+    /// Writes v2-{A..E}.png, live-maya and 3-band/2-band stacks to $WAYVIS_OUT.
     #[test]
     #[ignore]
     fn render_sheets() {
