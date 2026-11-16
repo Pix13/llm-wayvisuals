@@ -19,6 +19,22 @@ signal-hook = "0.4.6"
 clap = { version = "4.6.7", features = ["derive"] }
 # wayland (frontend task)
 # smithay-client-toolkit = "0.21"
+# optional GPU backend (feature `gpu`): femtovg on OpenGL 3.3 / GLES 3.0
+femtovg = { version = "0.28.0", default-features = false, features = [], optional = true }
+glow = { version = "0.18.0", default-features = false, optional = true }
+glutin = { version = "0.32.3", default-features = false, features = ["egl", "glx", "wayland", "x11"], optional = true }
+glutin-winit = { version = "0.5.0", default-features = false, features = ["egl", "glx", "wayland", "x11"], optional = true }
+raw-window-handle = { version = "0.6.2", optional = true }
+khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
+
+[features]
+default = []
+# Optional OpenGL rendering backend (hardware only, falls back to the CPU one).
+gpu = ["dep:femtovg", "dep:glow", "dep:glutin", "dep:glutin-winit", "dep:raw-window-handle", "dep:khronos-egl"]
 
 [profile.release]
 lto = "thin"
+
+[[example]]
+name = "gl_window"
+required-features = ["gpu"]

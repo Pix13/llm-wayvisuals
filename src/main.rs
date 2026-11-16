@@ -7,6 +7,7 @@ use frontend::{log, Backend, RunOptions, WinitBackend, DEFAULT_IDLE_AFTER};
 use llm_wayvisuals::config::Config;
 use llm_wayvisuals::model::{ModelSelect, Snapshot};
 use llm_wayvisuals::render::{PanelView, Renderer, Signal, HEIGHT, WIDTH};
+use llm_wayvisuals::rendersel::{self, RendererPref};
 use llm_wayvisuals::theme;
 use std::time::Duration;
 
@@ -47,6 +48,47 @@ fn main() {
         Some(Command::Run(a)) => run(a),
         Some(Command::RenderPng(a)) => render_png(a),
         Some(Command::BenchRender(a)) => bench(a),
+        #[cfg(feature = "gpu")]
+        Some(Command::CompareRenderers(a)) => compare(a),
+    }
+}
+
+/// Availability probe of the GPU path (headless hardware GL context).
+fn gpu_probe() -> Result<String, String> {
+    #[cfg(feature = "gpu")]
+    {
+        llm_wayvisuals::gl_render::probe()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Err("built without the gpu feature".into())
+    }
+}
+
+/// Renderer choice of the offscreen tools (`render-png`, `bench-render`):
+/// `--renderer` only (default cpu), no environment variable.
+fn tool_uses_gpu(v: &str) -> bool {
+    let pref = v.parse::<RendererPref>().unwrap_or_else(|e| fail(2, e));
+    let choice = rendersel::decide(pref, cfg!(feature = "gpu"), gpu_probe).unwrap_or_else(|e| fail(2, e));
+    log(choice.log_line());
+    choice.is_gpu()
+}
+
+#[cfg(feature = "gpu")]
+fn compare(a: cli::CompareArgs) {
+    let sizes: Vec<(u32, u32)> = a
+        .sizes
+        .split(',')
+        .map(|s| {
+            s.split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                .unwrap_or_else(|| fail(2, format!("bad size {s:?}")))
+        })
+        .collect();
+    match llm_wayvisuals::gl_render::compare::compare_all(a.fixtures.as_ref(), a.out.as_ref(), &sizes, a.all) {
+        Ok(true) => println!("all fixtures within thresholds (PSNR >= 35 dB, <= 1 % pixels off by > 16)"),
+        Ok(false) => fail(1, "some fixtures are out of thresholds (side-by-side PNGs written)"),
+        Err(e) => fail(1, e),
     }
 }
 
@@ -94,6 +136,14 @@ fn run(a: RunArgs) {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .map_or(DEFAULT_IDLE_AFTER, Duration::from_secs_f64);
+    // Renderer selection. The live window path still draws on the CPU: the GPU
+    // surface integration (see the gpu feature notes in the README) is pending.
+    let pref = rendersel::resolve_pref(a.renderer.as_deref(), std::env::var("LLMV_RENDERER").ok().as_deref()).unwrap_or_else(|e| fail(2, e));
+    match rendersel::decide(pref, cfg!(feature = "gpu"), gpu_probe) {
+        Ok(c) if c.is_gpu() => log(format!("{} -- window path not integrated yet, using cpu", c.log_line())),
+        Ok(c) => log(c.log_line()),
+        Err(e) => fail(2, e),
+    }
     let opts = RunOptions { panels: cfg.panels, windowed: a.window, fps: a.fps, idle_fps: a.idle_fps.min(a.fps), idle_after };
     if let Err(e) = backend.run(opts) {
         fail(1, e);
@@ -148,7 +198,16 @@ fn render_png(a: RenderPngArgs) {
         t: a.t,
     };
     let mut pm = tiny_skia::Pixmap::new(w, h).expect("size");
-    Renderer::new().render(&mut pm, &view);
+    if tool_uses_gpu(&a.renderer) {
+        #[cfg(feature = "gpu")]
+        {
+            let mut g = llm_wayvisuals::gl_render::GpuRenderer::new_headless().unwrap_or_else(|e| fail(1, e));
+            g.render(&mut Renderer::new(), w, h, &view);
+            pm = g.read_pixmap().unwrap_or_else(|| fail(1, "GPU readback failed"));
+        }
+    } else {
+        Renderer::new().render(&mut pm, &view);
+    }
     pm.save_png(out).expect("write png");
     eprintln!("wrote {out} ({w}x{h})");
 }
@@ -175,9 +234,19 @@ fn bench(a: cli::BenchArgs) {
         .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
         .filter(|&(w, h)| w > 0 && h > 0)
         .unwrap_or_else(|| fail(2, format!("bad --size {:?} (expected WIDTHxHEIGHT)", a.size)));
-    println!("render {w}x{h}, {} frames each", a.frames);
+    let gpu = tool_uses_gpu(&a.renderer);
+    println!("render {w}x{h}, {} frames each, {}", a.frames, if gpu { "gpu (incl. glFinish)" } else { "cpu" });
     for (name, with) in cases {
-        let (mean, max) = llm_wayvisuals::render::bench_size(parse(&name), a.frames, with, w, h);
+        let (mean, max) = if gpu {
+            #[cfg(feature = "gpu")]
+            {
+                llm_wayvisuals::gl_render::compare::bench_size(parse(&name), a.frames, with, w, h).unwrap_or_else(|e| fail(1, e))
+            }
+            #[cfg(not(feature = "gpu"))]
+            unreachable!()
+        } else {
+            llm_wayvisuals::render::bench_size(parse(&name), a.frames, with, w, h)
+        };
         let data = if with { "snapshot" } else { "no snapshot" };
         println!("{name:<11} {data:<12} mean {mean:6.2} ms  max {max:6.2} ms");
     }

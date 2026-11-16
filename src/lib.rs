@@ -16,3 +16,10 @@ pub mod profile;
 pub mod render;
 pub mod source;
 pub mod theme;
+pub mod rendersel;
+
+/// Optional OpenGL backend (femtovg), see `render/gl.rs`. Mounted here so that
+/// `render.rs` stays untouched; it can move to `render::gl` later.
+#[cfg(feature = "gpu")]
+#[path = "render/gl.rs"]
+pub mod gl_render;

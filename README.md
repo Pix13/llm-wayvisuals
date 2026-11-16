@@ -59,6 +59,30 @@ llm-wayvisuals --server /run/user/1000/llmv-0.json,output=DP-2 \
                --server http://host:9464,model=deepseek,title=Maya
 ```
 
+## GPU rendering (optional)
+
+The panels are drawn on the CPU by default. A build with the `gpu` feature can
+draw them with OpenGL instead (femtovg on a GL 3.3 core or GLES 3.0 context;
+EGL on Wayland, GLX/EGL on X11). Nothing GL-related is compiled without the
+feature.
+
+```
+cargo build --release --features gpu
+llm-wayvisuals --renderer auto|gpu|cpu ...      # default: auto, or $LLMV_RENDERER
+```
+
+- `auto`: GPU when a *hardware* GL context can be created, otherwise CPU.
+  Software renderers (llvmpipe, softpipe, swrast, lavapipe, Microsoft Basic
+  Render) are rejected on purpose: the CPU path is faster than they are.
+- `gpu`: same, but an error when unavailable. `cpu`: the tiny-skia path.
+- One line on stderr tells which one runs, e.g.
+  `renderer: gpu (AMD Radeon Graphics (radeonsi, ...), GL 4.6)` or
+  `renderer: cpu (reason)`.
+- `render-png --renderer gpu` and `bench-render --renderer gpu` use a headless
+  (surfaceless EGL) context. `compare-renderers` renders every fixture with both
+  backends and checks the differences (PSNR >= 35 dB, <= 1 % of the pixels off
+  by more than 16); side-by-side PNGs of failures are written to `--out`.
+
 ## Stacking
 
 One surface (a window, or a fullscreen monitor) shows 1 to 3 panels stacked

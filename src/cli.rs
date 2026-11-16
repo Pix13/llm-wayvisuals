@@ -31,7 +31,11 @@ pub enum Command {
     RenderPng(RenderPngArgs),
     /// Time the renderer (default: all signals)
     BenchRender(BenchArgs),
+    /// Render every fixture with the CPU and the GPU renderer and compare them
+    #[cfg(feature = "gpu")]
+    CompareRenderers(CompareArgs),
 }
+
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct RunArgs {
@@ -55,6 +59,10 @@ pub struct RunArgs {
     /// Frame rate while all live panels are idle (2 fps when none is live for 10 s)
     #[arg(long, default_value_t = 15, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=240))]
     pub idle_fps: u32,
+    /// Renderer: auto (GPU when a hardware GL context works, else CPU), gpu
+    /// (error if unavailable) or cpu. Default: LLMV_RENDERER, else auto.
+    #[arg(long, value_name = "auto|gpu|cpu")]
+    pub renderer: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -70,6 +78,26 @@ pub struct BenchArgs {
     /// WIDTHxHEIGHT of the pixmap (default 1920x480)
     #[arg(long, default_value = "1920x480")]
     pub size: String,
+    /// cpu (default) or gpu (headless GL context, time includes glFinish)
+    #[arg(long, value_name = "cpu|gpu", default_value = "cpu")]
+    pub renderer: String,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Args, Debug)]
+pub struct CompareArgs {
+    /// Directory holding the fixtures
+    #[arg(long, default_value = "fixtures")]
+    pub fixtures: String,
+    /// Directory for the side-by-side PNGs of failing fixtures
+    #[arg(long, default_value = ".")]
+    pub out: String,
+    /// WIDTHxHEIGHT list, comma separated
+    #[arg(long, default_value = "1920x480,1920x348")]
+    pub sizes: String,
+    /// Also write the PNGs of passing fixtures
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]
@@ -88,6 +116,9 @@ pub struct RenderPngArgs {
     /// WIDTHxHEIGHT
     #[arg(long, default_value = "1920x480")]
     pub size: String,
+    /// cpu (default) or gpu (headless GL context)
+    #[arg(long, value_name = "cpu|gpu", default_value = "cpu")]
+    pub renderer: String,
 }
 
 const KEYS: [&str; 6] = ["output", "theme", "model", "token-file", "name", "title"];
