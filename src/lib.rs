@@ -12,6 +12,7 @@
 pub mod config;
 pub mod history;
 pub mod model;
+pub mod profile;
 pub mod render;
 pub mod source;
 pub mod theme;

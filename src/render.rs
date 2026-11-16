@@ -12,6 +12,7 @@ mod v2;
 use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
 
 use crate::model::{ModelSelect, Phase, Snapshot};
+use crate::profile::{self, Cat};
 use crate::theme::{alpha, mix, Theme};
 use draw::{Align, Fonts};
 use fx::{DigitMetrics, Mask, Rain};
@@ -105,6 +106,7 @@ impl Renderer {
     /// nothing is squashed. Outside that range (or W outside 960..3840) the
     /// panel is centred with black around it.
     pub fn render(&mut self, pm: &mut Pixmap, view: &PanelView) {
+        let _p = profile::scope(Cat::Render);
         let (w, h) = (pm.width(), pm.height());
         let s = scale_for(w);
         let hd = design_height_for(w, h);
@@ -127,7 +129,10 @@ impl Renderer {
         let th = view.theme;
         let lay = scene::Lay::new(hd);
         self.ensure_static(th, &lay, pm.width(), pm.height());
-        pm.data_mut().copy_from_slice(self.stat.as_ref().unwrap().3.data());
+        {
+            let _p = profile::scope(Cat::StaticBlit);
+            pm.data_mut().copy_from_slice(self.stat.as_ref().unwrap().3.data());
+        }
 
         let live = view.signal == Signal::Live;
         let model = view.snapshot.and_then(|s| s.select(view.model));
@@ -137,6 +142,7 @@ impl Renderer {
         };
         if live {
             self.draw_dynamic(pm, view, &data, &lay, true, view.t);
+            let _p = profile::scope(Cat::Overlay);
             let right = self.title_right(view, &data);
             scene::draw_centre_title(pm, th, &self.fonts, &lay, &self.title_of(view, &data), right.as_deref());
         } else {
@@ -154,6 +160,7 @@ impl Renderer {
                 let img = self.build_frozen(pm, view, &data, &lay);
                 self.frozen = Some((key, img));
             }
+            let _p = profile::scope(Cat::Overlay);
             pm.data_mut().copy_from_slice(self.frozen.as_ref().unwrap().1.data());
             self.draw_no_signal(pm, view, &lay);
         }
@@ -211,12 +218,25 @@ impl Renderer {
 
     fn draw_dynamic(&mut self, pm: &mut Pixmap, view: &PanelView, data: &scene::Data, lay: &scene::Lay, live: bool, t: f32) {
         let th = view.theme;
-        scene::draw_top_dynamic(pm, th, &self.fonts, lay, data, t, live);
-        scene::draw_bottom_dynamic(pm, th, &self.fonts, lay, data);
-        let pv = v2::PathView::from(view.snapshot, data.model);
-        v2::draw_data_path(pm, th, &self.fonts, lay, &pv, t);
-        let cv = v2::CpuView::from(view.snapshot, data.model, view.cpu_wave);
-        v2::draw_cpu_card(pm, th, &self.fonts, lay, &cv);
+        {
+            let _p = profile::scope(Cat::TopCards);
+            scene::draw_top_dynamic(pm, th, &self.fonts, lay, data, t, live);
+        }
+        {
+            let _p = profile::scope(Cat::BottomCards);
+            scene::draw_bottom_dynamic(pm, th, &self.fonts, lay, data);
+        }
+        {
+            let _p = profile::scope(Cat::DataPath);
+            let pv = v2::PathView::from(view.snapshot, data.model);
+            v2::draw_data_path(pm, th, &self.fonts, lay, &pv, t);
+        }
+        {
+            let _p = profile::scope(Cat::CpuCard);
+            let cv = v2::CpuView::from(view.snapshot, data.model, view.cpu_wave);
+            v2::draw_cpu_card(pm, th, &self.fonts, lay, &cv);
+        }
+        let _p = profile::scope(Cat::Centre);
         self.draw_centre(pm, view, data, lay, live, t);
     }
 
@@ -249,7 +269,10 @@ impl Renderer {
         let u = lay.ut;
 
         // matrix rain behind everything, away from the label column
-        self.rain.draw(pm, th, c.x + 140.0, c.y + 46.0 * u, c.w - 150.0, c.h - 58.0 * u, t, 1.0);
+        {
+            let _p = profile::scope(Cat::Rain);
+            self.rain.draw(pm, th, c.x + 140.0, c.y + 46.0 * u, c.w - 150.0, c.h - 58.0 * u, t, 1.0);
+        }
 
         let m = d.model;
         let phase = m.map(|m| m.phase());

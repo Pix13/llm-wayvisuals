@@ -5,6 +5,7 @@ use super::{
     RunOptions, Target,
 };
 use llm_wayvisuals::config::MAX_PANELS;
+use llm_wayvisuals::profile::{self, Cat};
 use llm_wayvisuals::render;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use softbuffer::{Context, Surface};
@@ -225,6 +226,7 @@ impl App {
     }
 
     fn redraw(&mut self, idx: usize) {
+        let _frame = profile::scope(Cat::Frame);
         let t = self.start.elapsed().as_secs_f32();
         let sw = &mut self.surfaces[idx];
         let size = sw.window.inner_size();
@@ -260,6 +262,7 @@ impl App {
                 desc.join(", ")
             ));
         }
+        let acquire = profile::scope(Cat::Acquire);
         let mut buf = match sw.surface.buffer_mut() {
             Ok(b) => b,
             Err(e) => {
@@ -267,6 +270,7 @@ impl App {
                 return;
             }
         };
+        drop(acquire);
         let stride = size.width as usize;
         if geo.len() == 1 {
             // Letterbox rows outside the single band.
@@ -275,7 +279,7 @@ impl App {
             buf[..top].fill(0);
             buf[bottom..].fill(0);
         }
-        for (slot, b) in sw.slots.iter_mut().zip(&geo) {
+        for (bi, (slot, b)) in sw.slots.iter_mut().zip(&geo).enumerate() {
             if b.w == 0 || b.h == 0 {
                 continue;
             }
@@ -284,11 +288,20 @@ impl App {
             }
             let Some(pm) = slot.pm.as_mut() else { continue };
             slot.core.render(pm, t);
-            blit_xrgb(pm.data(), b.w as usize, &mut buf, stride, b.x as usize, b.y as usize);
+            {
+                let _p = profile::scope(Cat::Convert);
+                blit_xrgb(pm.data(), b.w as usize, &mut buf, stride, b.x as usize, b.y as usize);
+            }
+            profile::tiles(idx, bi, pm.data(), b.w as usize, b.h as usize);
         }
-        if let Err(e) = buf.present() {
-            log(format!("present failed: {e}"));
+        {
+            let _p = profile::scope(Cat::Present);
+            if let Err(e) = buf.present() {
+                log(format!("present failed: {e}"));
+            }
         }
+        drop(_frame);
+        profile::frame_done();
     }
 
     fn toggle_fullscreen(&mut self, idx: usize) {
@@ -347,6 +360,7 @@ impl ApplicationHandler for App {
         if now >= self.next_frame {
             let mut acts = Vec::new();
             for s in &mut self.surfaces {
+                let _p = profile::scope(Cat::Tick);
                 for slot in &mut s.slots {
                     acts.push(slot.core.tick(now));
                 }
