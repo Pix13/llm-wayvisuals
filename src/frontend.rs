@@ -35,6 +35,8 @@ pub struct RunOptions {
     pub idle_fps: u32,
     /// Drop to `IDLE_FPS` when no panel was live for this long.
     pub idle_after: Duration,
+    /// `--renderer`: decided per surface when its window is created.
+    pub renderer: llm_wayvisuals::rendersel::RendererPref,
 }
 
 /// Frame rate when no panel has been live for `idle_after`.
@@ -466,8 +468,8 @@ impl PanelCore {
         }
     }
 
-    /// Renders into the panel's persistent band pixmap; returns what changed.
-    pub fn render(&mut self, pm: &mut Pixmap, t: f32) -> Damage {
+    /// Calls `f` with the panel's current view.
+    fn with_view<R>(&mut self, t: f32, f: impl FnOnce(&mut Renderer, &PanelView) -> R) -> R {
         let now = Instant::now();
         let wave = self.history.samples(now);
         let cpu_wave = self.cpu.samples(now);
@@ -482,7 +484,19 @@ impl PanelCore {
             cpu_wave: &cpu_wave,
             t,
         };
-        self.renderer.render_incremental(pm, &view)
+        f(&mut self.renderer, &view)
+    }
+
+    /// Renders into the panel's persistent band pixmap; returns what changed.
+    pub fn render(&mut self, pm: &mut Pixmap, t: f32) -> Damage {
+        self.with_view(t, |r, view| r.render_incremental(pm, view))
+    }
+
+    /// GPU path: records the whole `w` x `h` band into image `band` of `gpu`
+    /// (no damage tracking).
+    #[cfg(feature = "gpu")]
+    pub fn render_gpu(&mut self, gpu: &mut llm_wayvisuals::render::gl::GpuRenderer, band: usize, w: u32, h: u32, t: f32) {
+        self.with_view(t, |r, view| gpu.render_band(band, r, w, h, view))
     }
 }
 

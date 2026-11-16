@@ -6,8 +6,8 @@
 
 use std::time::Instant;
 
-use llm_wayvisuals::gl_render::window::GlWindow;
-use llm_wayvisuals::gl_render::GpuRenderer;
+use llm_wayvisuals::render::gl::window::GlWindow;
+use llm_wayvisuals::render::gl::GpuRenderer;
 use llm_wayvisuals::model::{ModelSelect, Snapshot};
 use llm_wayvisuals::render::{PanelView, Renderer, Signal};
 use winit::application::ApplicationHandler;

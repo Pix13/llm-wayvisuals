@@ -49,9 +49,13 @@ pub enum Cat {
     Acquire,
     /// `buffer.present()`.
     Present,
+    /// GPU path: femtovg tessellation + GL calls of a flush (CPU side).
+    GlSubmit,
+    /// GPU path: `swap_buffers`.
+    GlSwap,
 }
 
-const CATS: [(Cat, &str); 17] = [
+const CATS: [(Cat, &str); 19] = [
     (Cat::Tick, "tick/feed"),
     (Cat::Frame, "frame (redraw)"),
     (Cat::Render, "render"),
@@ -69,6 +73,8 @@ const CATS: [(Cat, &str); 17] = [
     (Cat::Convert, "convert"),
     (Cat::Acquire, "acquire buf"),
     (Cat::Present, "present"),
+    (Cat::GlSubmit, "gl submit"),
+    (Cat::GlSwap, "gl swap"),
 ];
 
 static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on, 3 on + tiles

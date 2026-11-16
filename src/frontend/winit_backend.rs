@@ -26,6 +26,12 @@ use winit::window::{CursorIcon, Fullscreen, Window, WindowAttributes, WindowId};
 
 const APP_ID: &str = "llm-wayvisuals";
 
+/// GPU renderer of a surface (uninhabited when built without the `gpu` feature).
+#[cfg(feature = "gpu")]
+type Gpu = llm_wayvisuals::render::gl::GpuRenderer;
+#[cfg(not(feature = "gpu"))]
+type Gpu = std::convert::Infallible;
+
 pub struct WinitBackend;
 
 fn backend_name(el: &ActiveEventLoop) -> &'static str {
@@ -126,9 +132,13 @@ struct Slot {
 
 /// One window / fullscreen monitor showing 1..=3 stacked panels.
 struct SurfaceWin {
+    /// GL renderer (declared first: dropped before the window it draws on).
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu: Option<Gpu>,
     slots: Vec<Slot>,
     window: Arc<Window>,
-    surface: Surface<OwnedDisplayHandle, Arc<Window>>,
+    /// softbuffer surface of the CPU path (`None` on a GPU surface).
+    surface: Option<Surface<OwnedDisplayHandle, Arc<Window>>>,
     /// Monitor used when toggling to fullscreen.
     monitor: Option<MonitorHandle>,
     /// Last logged inner size (to log geometry once per change).
@@ -161,6 +171,37 @@ fn attrs(title: &str) -> WindowAttributes {
 }
 
 impl App {
+    /// Creates the window of surface `n` with the renderer asked for: GPU
+    /// (GL context on the window) or CPU (plain window, softbuffer). In `auto`
+    /// any GPU failure falls back to the CPU with one line saying why.
+    fn make_window(&self, el: &ActiveEventLoop, a: WindowAttributes, n: usize) -> Result<(Arc<Window>, Option<Gpu>), String> {
+        use llm_wayvisuals::rendersel::RendererPref;
+        let pref = self.opts.renderer;
+        #[cfg(feature = "gpu")]
+        if pref != RendererPref::Cpu {
+            use llm_wayvisuals::render::gl::{window::GlWindow, GpuRenderer};
+            let made = GlWindow::create(el, a.clone()).and_then(|(w, glw)| GpuRenderer::from_context(Box::new(glw)).map(|g| (w, g)));
+            match made {
+                Ok((w, g)) => {
+                    log(format!("surface {n}: renderer: gpu ({})", g.info().describe()));
+                    return Ok((Arc::new(w), Some(g)));
+                }
+                Err(e) if pref == RendererPref::Gpu => return Err(format!("surface {n}: --renderer gpu: {e}")),
+                Err(e) => log(format!("surface {n}: renderer: cpu ({e})")),
+            }
+        } else {
+            log(format!("surface {n}: renderer: cpu (requested)"));
+        }
+        #[cfg(not(feature = "gpu"))]
+        match pref {
+            RendererPref::Gpu => return Err("--renderer gpu: this build has no GPU backend".into()),
+            RendererPref::Cpu => log(format!("surface {n}: renderer: cpu (requested)")),
+            RendererPref::Auto => log(format!("surface {n}: renderer: cpu (built without the gpu feature)")),
+        }
+        let w = el.create_window(a).map_err(|e| format!("create window: {e}"))?;
+        Ok((Arc::new(w), None))
+    }
+
     fn create_surfaces(&mut self, el: &ActiveEventLoop) -> Result<(), String> {
         let monitors: Vec<MonitorHandle> = el.available_monitors().collect();
         let names = monitor_names(&monitors);
@@ -194,12 +235,14 @@ impl App {
                 .map(|core| Slot { core, pm: None })
                 .collect();
             let list = slots.iter().map(|s| s.core.cfg.name.clone()).collect::<Vec<_>>();
+            let gpu: Option<Gpu>;
             let (window, monitor, what) = match &target {
                 Target::Monitor(i) => {
                     let m = monitors[*i].clone();
                     let a = attrs(APP_ID).with_fullscreen(Some(Fullscreen::Borderless(Some(m.clone()))));
-                    let w = el.create_window(a).map_err(|e| format!("create window: {e}"))?;
+                    let (w, g) = self.make_window(el, a, n + 1)?;
                     w.set_cursor_visible(false);
+                    gpu = g;
                     (w, Some(m), format!("{}, fullscreen", names[*i].0))
                 }
                 Target::Windowed { reason } => {
@@ -212,17 +255,20 @@ impl App {
                     let (w, h) = default_window_size(screen);
                     let a = attrs(&format!("llm-wayvisuals \u{2014} {}", list.join(", ")))
                         .with_inner_size(winit::dpi::PhysicalSize::new(w, h));
-                    let w = el.create_window(a).map_err(|e| format!("create window: {e}"))?;
+                    let (w, g) = self.make_window(el, a, n + 1)?;
                     let m = w.current_monitor();
+                    gpu = g;
                     (w, m, "window".to_string())
                 }
             };
             log(format!("surface {} ({what}): {}", n + 1, list.join(", ")));
-            let window = Arc::new(window);
-            let surface = Surface::new(&ctx, window.clone()).map_err(|e| format!("softbuffer: {e}"))?;
+            let surface = match gpu {
+                Some(_) => None,
+                None => Some(Surface::new(&ctx, window.clone()).map_err(|e| format!("softbuffer: {e}"))?),
+            };
             self.by_id.insert(window.id(), self.surfaces.len());
             window.request_redraw();
-            self.surfaces.push(SurfaceWin { slots, window, surface, monitor, last_size: None, index: n + 1, hist: VecDeque::new() });
+            self.surfaces.push(SurfaceWin { gpu, slots, window, surface, monitor, last_size: None, index: n + 1, hist: VecDeque::new() });
         }
         self.ctx = Some(ctx);
         Ok(())
@@ -236,8 +282,10 @@ impl App {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return;
         };
-        if sw.surface.resize(w, h).is_err() {
-            return;
+        if let Some(surface) = sw.surface.as_mut() {
+            if surface.resize(w, h).is_err() {
+                return;
+            }
         }
         let geo = bands(size.width, size.height, sw.slots.len());
         let mut resized = false;
@@ -268,6 +316,27 @@ impl App {
                 desc.join(", ")
             ));
         }
+        #[cfg(feature = "gpu")]
+        if let Some(g) = sw.gpu.as_mut() {
+            // GPU surface: every band is redrawn into the GL framebuffer each frame.
+            if resized {
+                g.resize_surface(size.width, size.height);
+            }
+            let mut placed = Vec::with_capacity(geo.len());
+            for (bi, (slot, b)) in sw.slots.iter_mut().zip(&geo).enumerate() {
+                if b.w == 0 || b.h == 0 {
+                    continue;
+                }
+                slot.core.render_gpu(g, bi, b.w, b.h, t);
+                placed.push((bi, b.x as i32, b.y as i32));
+            }
+            if let Err(e) = g.present_bands(&placed, size.width, size.height) {
+                log(format!("present failed: {e}"));
+            }
+            drop(_frame);
+            profile::frame_done();
+            return;
+        }
         // 1. render every band into its persistent pixmap, collect the damage
         let mut full = resized;
         let mut cur: Vec<render::Rect> = Vec::new();
@@ -295,7 +364,7 @@ impl App {
         }
         // 2. get a buffer and bring it up to date
         let acquire = profile::scope(Cat::Acquire);
-        let mut buf = match sw.surface.buffer_mut() {
+        let mut buf = match sw.surface.as_mut().expect("cpu surface").buffer_mut() {
             Ok(b) => b,
             Err(e) => {
                 log(format!("buffer failed: {e}"));

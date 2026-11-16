@@ -8,13 +8,9 @@
 //! Software renderers (llvmpipe, ...) are rejected at context creation: the
 //! CPU path is faster than they are.
 
-#[path = "gl/compare.rs"]
 pub mod compare;
-#[path = "gl/headless.rs"]
 mod headless;
-#[path = "gl/store.rs"]
 mod store;
-#[path = "gl/window.rs"]
 pub mod window;
 
 use std::ffi::c_void;
@@ -117,14 +113,28 @@ impl GpuRenderer {
     /// Renders one `w` x `h` frame of `view` into the internal frame image and
     /// submits it to the GPU (does not wait for completion).
     pub fn render(&mut self, r: &mut Renderer, w: u32, h: u32, view: &PanelView) {
-        let _ = self.ctx.make_current();
         let t0 = std::time::Instant::now();
-        self.store.begin_frame(w, h);
-        r.render_canvas(&mut self.store, w, h, view);
+        self.render_band(0, r, w, h, view);
         let t1 = std::time::Instant::now();
-        self.store.flush();
+        self.submit();
         self.last_record_ms = (t1 - t0).as_secs_f64() * 1e3;
         self.last_submit_ms = t1.elapsed().as_secs_f64() * 1e3;
+    }
+
+    /// Records one `w` x `h` band of a surface frame into its own image
+    /// (index `band`, 0 for the first). Nothing reaches the GPU before
+    /// [`GpuRenderer::submit`] or [`GpuRenderer::present_bands`]. Each band
+    /// needs its own `Renderer` (its cached layers live in this renderer).
+    pub fn render_band(&mut self, band: usize, r: &mut Renderer, w: u32, h: u32, view: &PanelView) {
+        let _ = self.ctx.make_current();
+        self.store.begin_frame(band, w, h);
+        r.render_canvas(&mut self.store, w, h, view);
+    }
+
+    /// Sends the recorded commands to the driver.
+    pub fn submit(&mut self) {
+        let _p = crate::profile::scope(crate::profile::Cat::GlSubmit);
+        self.store.flush();
     }
 
     /// Blocks until the GPU has finished (benchmarks).
@@ -134,7 +144,7 @@ impl GpuRenderer {
 
     /// Top-down premultiplied RGBA of the last frame: `(w, h, bytes)`.
     pub fn read_rgba(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        self.store.read_frame()
+        self.store.read_frame(0)
     }
 
     /// Last frame as a tiny-skia pixmap.
@@ -150,12 +160,22 @@ impl GpuRenderer {
         self.ctx.resize(w, h);
     }
 
-    /// Draws the last frame over the window surface of `sw` x `sh` pixels and
-    /// swaps buffers.
-    pub fn present(&mut self, sw: u32, sh: u32) -> Result<(), String> {
+    /// Composes the band images over the window surface of `sw` x `sh`
+    /// pixels (black background; `(band, x, y)` = position of each band),
+    /// submits everything and swaps buffers.
+    pub fn present_bands(&mut self, bands: &[(usize, i32, i32)], sw: u32, sh: u32) -> Result<(), String> {
         self.ctx.make_current()?;
-        self.store.present_to_screen(sw, sh);
+        {
+            let _p = crate::profile::scope(crate::profile::Cat::GlSubmit);
+            self.store.present_to_screen(bands, sw, sh);
+        }
+        let _p = crate::profile::scope(crate::profile::Cat::GlSwap);
         self.ctx.swap_buffers()
+    }
+
+    /// Single band, at the origin.
+    pub fn present(&mut self, sw: u32, sh: u32) -> Result<(), String> {
+        self.present_bands(&[(0, 0, 0)], sw, sh)
     }
 }
 

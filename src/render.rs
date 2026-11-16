@@ -7,6 +7,8 @@ pub mod canvas;
 mod draw;
 mod fmt;
 mod fx;
+#[cfg(feature = "gpu")]
+pub mod gl;
 pub mod incr;
 mod scene;
 pub mod skia;

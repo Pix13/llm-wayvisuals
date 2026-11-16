@@ -85,7 +85,9 @@ pub struct GlStore {
     view: (f32, f32, f32),
     glyphs: Option<GlyphAtlas>,
     layers: Vec<Option<Layer>>,
-    frame: Option<Layer>,
+    /// Frame images by band index; `cur_frame` is the one being drawn.
+    frames: Vec<Option<Layer>>,
+    cur_frame: usize,
     stack: Vec<Target>,
     cov: HashMap<(u32, u32, u64), CovEntry>,
     frame_no: u64,
@@ -122,7 +124,8 @@ impl GlStore {
             view: (1.0, 0.0, 0.0),
             glyphs: None,
             layers: Vec::new(),
-            frame: None,
+            frames: Vec::new(),
+            cur_frame: 0,
             stack: Vec::new(),
             cov: HashMap::new(),
             frame_no: 0,
@@ -131,24 +134,31 @@ impl GlStore {
 
     // ---- frame management (called by `GpuRenderer`) --------------------------------
 
-    /// Starts a frame of `w` x `h` pixels: (re)allocates the frame image and
+    /// Starts (or continues, for another band of the same surface frame) a
+    /// frame of `w` x `h` pixels for band `band`: (re)allocates its image and
     /// directs drawing to it.
-    pub(super) fn begin_frame(&mut self, w: u32, h: u32) {
-        self.frame_no += 1;
-        self.stack.clear();
-        if self.glyphs.as_ref().is_some_and(|a| a.full) {
-            // The previous frame ran out of room: start over (all its draws are submitted).
-            if let Some(a) = self.glyphs.take() {
-                self.cv.delete_image(a.img);
+    pub(super) fn begin_frame(&mut self, band: usize, w: u32, h: u32) {
+        if band == 0 {
+            self.frame_no += 1;
+            if self.glyphs.as_ref().is_some_and(|a| a.full) {
+                // The previous frame ran out of room: start over (all its draws are submitted).
+                if let Some(a) = self.glyphs.take() {
+                    self.cv.delete_image(a.img);
+                }
             }
         }
+        self.stack.clear();
         self.cv.set_size(w, h, 1.0);
-        if self.frame.as_ref().map_or(true, |f| (f.w, f.h) != (w, h)) {
-            if let Some(f) = self.frame.take() {
+        if self.frames.len() <= band {
+            self.frames.resize_with(band + 1, || None);
+        }
+        if self.frames[band].as_ref().is_none_or(|f| (f.w, f.h) != (w, h)) {
+            if let Some(f) = self.frames[band].take() {
                 self.cv.delete_image(f.id);
             }
-            self.frame = Some(self.alloc_image(w, h));
+            self.frames[band] = Some(self.alloc_image(w, h));
         }
+        self.cur_frame = band;
         self.select(Target::Frame);
         self.cv.reset_scissor();
         self.cv.reset_transform();
@@ -160,13 +170,17 @@ impl GlStore {
         self.cv.flush();
     }
 
-    pub(super) fn frame_image(&self) -> Option<(ImageId, u32, u32)> {
-        self.frame.as_ref().map(|f| (f.id, f.w, f.h))
+    pub(super) fn frame_image(&self, band: usize) -> Option<(ImageId, u32, u32)> {
+        self.frames.get(band)?.as_ref().map(|f| (f.id, f.w, f.h))
+    }
+
+    fn cur_frame_layer(&self) -> &Layer {
+        self.frames[self.cur_frame].as_ref().expect("frame")
     }
 
     /// Top-down premultiplied RGBA of the frame (flushes first).
-    pub(super) fn read_frame(&mut self) -> Option<(u32, u32, Vec<u8>)> {
-        let (id, w, h) = self.frame_image()?;
+    pub(super) fn read_frame(&mut self, band: usize) -> Option<(u32, u32, Vec<u8>)> {
+        let (id, w, h) = self.frame_image(band)?;
         self.flush();
         let mut px = self.read_image(id, w, h)?;
         flip_rows(&mut px, w as usize, h as usize);
@@ -198,28 +212,28 @@ impl GlStore {
         Some(out)
     }
 
-    /// Draws the frame image over the whole (window) screen target.
-    pub(super) fn present_to_screen(&mut self, sw: u32, sh: u32) {
-        let Some((id, w, h)) = self.frame_image() else { return };
+    /// Composes the band images on the window's default framebuffer of `sw` x
+    /// `sh` pixels: black background, each `(band, x, y)` image copied at its
+    /// position (top-left origin). Submits the commands.
+    pub(super) fn present_to_screen(&mut self, bands: &[(usize, i32, i32)], sw: u32, sh: u32) {
         self.cv.set_size(sw, sh, 1.0);
         self.cv.set_render_target(RenderTarget::Screen);
         self.cv.reset_transform();
         self.cv.reset_scissor();
-        self.cv.save();
-        self.cv.global_composite_operation(CompositeOperation::Copy);
-        let paint = Paint::image(id, 0.0, 0.0, w as f32, h as f32, 0.0, 1.0).with_anti_alias(false);
-        let mut p = femtovg::Path::new();
-        p.rect(0.0, 0.0, w as f32, h as f32);
-        self.cv.fill_path(&p, &paint);
-        self.cv.restore();
-        self.cv.flush();
+        self.cv.clear_rect(0, 0, sw, sh, femtovg::Color::rgba(0, 0, 0, 255));
+        for &(band, x, y) in bands {
+            if let Some((id, w, h)) = self.frame_image(band) {
+                self.draw_image(id, x, y, w, h, CompositeOperation::Copy);
+            }
+        }
+        self.flush();
     }
 
     // ---- internals ----------------------------------------------------------------------
 
     fn select(&mut self, t: Target) {
         let id = match t {
-            Target::Frame => self.frame.as_ref().expect("frame").id,
+            Target::Frame => self.cur_frame_layer().id,
             Target::Layer(i) => self.layers[i].as_ref().expect("live layer").id,
         };
         self.cv.set_render_target(RenderTarget::Image(id));
@@ -231,7 +245,7 @@ impl GlStore {
 
     fn cur_size(&self) -> (u32, u32) {
         match self.cur() {
-            Target::Frame => self.frame.as_ref().map_or((0, 0), |f| (f.w, f.h)),
+            Target::Frame => self.frames.get(self.cur_frame).and_then(Option::as_ref).map_or((0, 0), |f| (f.w, f.h)),
             Target::Layer(i) => self.layers[i].as_ref().map_or((0, 0), |l| (l.w, l.h)),
         }
     }
@@ -582,7 +596,7 @@ impl Canvas for GlStore {
     fn layer_capture(&mut self, id: LayerId) {
         let (dst, w, h) = self.layer_ref(id);
         let src = match self.cur() {
-            Target::Frame => self.frame.as_ref().expect("frame").id,
+            Target::Frame => self.cur_frame_layer().id,
             Target::Layer(i) => self.layers[i].as_ref().expect("live layer").id,
         };
         let cur = self.cur();

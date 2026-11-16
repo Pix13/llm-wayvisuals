@@ -28,7 +28,7 @@ raw-window-handle = { version = "0.6.2", optional = true }
 khronos-egl = { version = "6.0.0", features = ["dynamic"], optional = true }
 
 [features]
-default = []
+default = ["gpu"]
 # Optional OpenGL rendering backend (hardware only, falls back to the CPU one).
 gpu = ["dep:femtovg", "dep:glow", "dep:glutin", "dep:glutin-winit", "dep:raw-window-handle", "dep:khronos-egl"]
 

@@ -59,25 +59,31 @@ llm-wayvisuals --server /run/user/1000/llmv-0.json,output=DP-2 \
                --server http://host:9464,model=deepseek,title=Maya
 ```
 
-## GPU rendering (optional)
+## GPU rendering
 
-The panels are drawn on the CPU by default. A build with the `gpu` feature can
-draw them with OpenGL instead (femtovg on a GL 3.3 core or GLES 3.0 context;
-EGL on Wayland, GLX/EGL on X11). Nothing GL-related is compiled without the
-feature.
+Panels can be drawn with OpenGL (femtovg on a GL 3.3 core or GLES 3.0 context;
+EGL on Wayland, GLX/EGL on X11) instead of the CPU. The `gpu` cargo feature is
+on by default; `cargo build --release --no-default-features` builds the pure
+CPU client with no GL code or dependency.
 
 ```
-cargo build --release --features gpu
 llm-wayvisuals --renderer auto|gpu|cpu ...      # default: auto, or $LLMV_RENDERER
 ```
 
-- `auto`: GPU when a *hardware* GL context can be created, otherwise CPU.
-  Software renderers (llvmpipe, softpipe, swrast, lavapipe, Microsoft Basic
-  Render) are rejected on purpose: the CPU path is faster than they are.
+- `auto`: per surface (window or monitor), GPU when a *hardware* GL context can
+  be created, otherwise that surface falls back to the CPU path. Software
+  renderers (llvmpipe, softpipe, swrast, lavapipe, Microsoft Basic Render) are
+  rejected on purpose.
 - `gpu`: same, but an error when unavailable. `cpu`: the tiny-skia path.
-- One line on stderr tells which one runs, e.g.
-  `renderer: gpu (AMD Radeon Graphics (radeonsi, ...), GL 4.6)` or
-  `renderer: cpu (reason)`.
+- One stderr line per surface says which one runs, e.g.
+  `surface 1: renderer: gpu (AMD Radeon Graphics (radeonsi, ...), GL 4.6)` or
+  `surface 1: renderer: cpu (reason)`.
+- The GPU path redraws all bands every frame (no damage tracking) and swaps
+  with swap interval 0: frames are paced by the application (`--fps`).
+  `LLMV_PROFILE=1` reports `gl submit` and `gl swap` for it.
+- Note: the CPU path is incremental (damage based) and its CPU use is already
+  low, so the GPU path is not necessarily cheaper in CPU terms (see the
+  profiler on your machine).
 - `render-png --renderer gpu` and `bench-render --renderer gpu` use a headless
   (surfaceless EGL) context. `compare-renderers` renders every fixture with both
   backends and checks the differences (PSNR >= 35 dB, <= 1 % of the pixels off
