@@ -1,9 +1,8 @@
 //! Effects: giant gradient digits with mirror reflection, matrix rain, waveform.
 
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
-use tiny_skia::{Color, PathBuilder, Pixmap};
-
-use super::draw::{self, blend_px, rgb255};
+use super::canvas::{Canvas, Cov, CovRow};
+use super::draw::{self, rgb255, Color, PathBuilder};
 use crate::theme::{alpha, mix, Theme};
 
 /// Coverage bitmap of a line of digits. Rows `0..base` are above the baseline.
@@ -13,6 +12,12 @@ pub struct Mask {
     pub h: usize,
     pub base: usize,
     pub data: Vec<u8>,
+}
+
+impl Mask {
+    pub fn cov(&self) -> Cov<'_> {
+        Cov { w: self.w, h: self.h, data: &self.data }
+    }
 }
 
 /// Metrics of the digit font, relative to the font size.
@@ -74,38 +79,11 @@ pub fn digits_mask(font: &FontRef, s: &str, size: f32, cap_px: f32, cell: f32, d
     Mask { w, h, base, data }
 }
 
-fn blit_rows(pm: &mut Pixmap, m: &Mask, x: i32, y: i32, mut colour_at: impl FnMut(usize) -> ([f32; 3], f32), dx: i32, dy: i32) {
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-    let data = pm.data_mut();
-    for row in 0..m.h {
-        let (rgb, a) = colour_at(row);
-        if a <= 0.0 {
-            continue;
-        }
-        let py = y + row as i32 + dy;
-        if py < 0 || py >= ph {
-            continue;
-        }
-        for col in 0..m.w {
-            let c = m.data[row * m.w + col];
-            if c == 0 {
-                continue;
-            }
-            let px = x + col as i32 + dx;
-            if px < 0 || px >= pw {
-                continue;
-            }
-            let i = ((py * pw + px) * 4) as usize;
-            blend_px(&mut data[i..i + 4], rgb, c as f32 / 255.0 * a);
-        }
-    }
-}
-
 /// Draws the mask (top-left at x,y) with a vertical gradient, a cheap
 /// 4-tap glow and a squashed mirror reflection below the baseline.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_digits(
-    pm: &mut Pixmap,
+    pm: &mut dyn Canvas,
     m: &Mask,
     x: i32,
     y: i32,
@@ -115,29 +93,27 @@ pub fn draw_digits(
     refl_h: usize,
     k: f32,
 ) {
+    let cov = m.cov();
     let grad = |row: usize| {
         let t = (row as f32 / m.base as f32).clamp(0.0, 1.0);
-        (rgb255(mix(top, bottom, t)), k)
+        rgb255(mix(top, bottom, t))
     };
     // glow
     let g = rgb255(glow);
-    let o = (3.0 * draw::view().0).round().max(1.0) as i32;
+    let o = (3.0 * pm.view().0).round().max(1.0) as i32;
     let o2 = (o * 2 / 3).max(1);
     for (dx, dy) in [(-o, 0), (o, 0), (0, -o), (0, o), (-o2, o2), (o2, o2)] {
-        blit_rows(pm, m, x, y, |_| (g, 0.07 * k), dx, dy);
+        pm.blit_cov(&cov, x + dx, y + dy, g, 0.07 * k, None);
     }
-    blit_rows(pm, m, x, y, grad, 0, 0);
+    let rows: Vec<CovRow> = (0..m.h).map(|row| CovRow { src_row: row, dst_y: y + row as i32, rgb: grad(row), a: k }).collect();
+    pm.blit_cov_rows(&cov, x, &rows);
 
     // reflection: row r below the baseline samples the mask at base - r/squash
     let squash = 0.42f32;
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-    let data = pm.data_mut();
     let by = y + m.base as i32;
+    let mut rows = Vec::with_capacity(refl_h);
     for r in 0..refl_h {
         let py = by + 1 + r as i32;
-        if py < 0 || py >= ph {
-            continue;
-        }
         let src = m.base as f32 - 1.0 - r as f32 / squash;
         if src < 0.0 {
             break;
@@ -147,20 +123,9 @@ pub fn draw_digits(
         let scan = if r % 3 == 2 { 0.45 } else { 1.0 };
         let a = 0.5 * fade * scan * k;
         let t = (srow as f32 / m.base as f32).clamp(0.0, 1.0);
-        let rgb = rgb255(mix(top, bottom, t));
-        for col in 0..m.w {
-            let c = m.data[srow * m.w + col];
-            if c == 0 {
-                continue;
-            }
-            let px = x + col as i32;
-            if px < 0 || px >= pw {
-                continue;
-            }
-            let i = ((py * pw + px) * 4) as usize;
-            blend_px(&mut data[i..i + 4], rgb, c as f32 / 255.0 * a);
-        }
+        rows.push(CovRow { src_row: srow, dst_y: py, rgb: rgb255(mix(top, bottom, t)), a });
     }
+    pm.blit_cov_rows(&cov, x, &rows);
 }
 
 // ---- matrix rain ---------------------------------------------------------
@@ -236,37 +201,18 @@ impl Rain {
             .collect();
     }
 
-    fn put(&self, pm: &mut Pixmap, idx: usize, cx: f32, base_y: f32, clip: (i32, i32, i32, i32), rgb: [f32; 3], a: f32) {
+    fn put(&self, pm: &mut dyn Canvas, idx: usize, cx: f32, base_y: f32, clip: (i32, i32, i32, i32), rgb: [f32; 3], a: f32) {
         let g = &self.glyphs[idx % self.glyphs.len()];
-        let (cx, base_y) = (draw::tx(cx), draw::ty(base_y));
-        let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-        let data = pm.data_mut();
+        let (cx, base_y) = (draw::tx(pm, cx), draw::ty(pm, base_y));
         let gx = cx.round() as i32 + g.ox - (g.w as i32) / 2 - g.ox;
         let gy = base_y.round() as i32 + g.oy;
-        for yy in 0..g.h {
-            let py = gy + yy as i32;
-            if py < clip.1 || py >= clip.3 || py < 0 || py >= ph {
-                continue;
-            }
-            for xx in 0..g.w {
-                let px = gx + xx as i32;
-                if px < clip.0 || px >= clip.2 || px < 0 || px >= pw {
-                    continue;
-                }
-                let c = g.cov[yy * g.w + xx];
-                if c == 0 {
-                    continue;
-                }
-                let i = ((py * pw + px) * 4) as usize;
-                blend_px(&mut data[i..i + 4], rgb, c as f32 / 255.0 * a);
-            }
-        }
+        pm.blit_cov(&Cov { w: g.w, h: g.h, data: &g.cov }, gx, gy, rgb, a, Some(clip));
     }
 
     /// Deterministic in `t`: falling columns of characters, brighter heads.
-    pub fn draw(&mut self, pm: &mut Pixmap, th: &Theme, x: f32, y: f32, w: f32, h: f32, t: f32, k: f32) {
-        self.ensure(draw::view().0);
-        let clip = (draw::tx(x) as i32, draw::ty(y) as i32, draw::tx(x + w) as i32, draw::ty(y + h) as i32);
+    pub fn draw(&mut self, pm: &mut dyn Canvas, th: &Theme, x: f32, y: f32, w: f32, h: f32, t: f32, k: f32) {
+        self.ensure(pm.view().0);
+        let clip = (draw::tx(pm, x) as i32, draw::ty(pm, y) as i32, draw::tx(pm, x + w) as i32, draw::ty(pm, y + h) as i32);
         let body = rgb255(th.rain);
         let head = rgb255(mix(th.rain, Color::WHITE, 0.6));
         let cols = ((w - 12.0) / RAIN_COL) as u32;
@@ -307,7 +253,7 @@ impl Rain {
 
 /// `wave`: (age 0..1, 0 = now at the right edge; value), None = gap.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_wave(pm: &mut Pixmap, th: &Theme, wave: &[(f32, Option<f32>)], max: Option<f32>, x: f32, y: f32, w: f32, h: f32, k: f32) {
+pub fn draw_wave(pm: &mut dyn Canvas, th: &Theme, wave: &[(f32, Option<f32>)], max: Option<f32>, x: f32, y: f32, w: f32, h: f32, k: f32) {
     // baseline
     draw::line(pm, x, y + h, x + w, y + h, alpha(th.accent, 0.25 * k), 1.0);
     draw::line(pm, x, y, x + w, y, alpha(th.accent, 0.08 * k), 1.0);

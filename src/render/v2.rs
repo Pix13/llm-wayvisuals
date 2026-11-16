@@ -1,7 +1,7 @@
 //! DATA PATH diagram (left card) and CPU card, driven by the v2 export
 //! fields (`Snapshot.system`, `Model.bandwidth`, `process_cpu_pct`, ...).
 
-use tiny_skia::{Color, PathBuilder, Pixmap};
+use super::canvas::Canvas;
 
 use super::draw::*;
 use super::fmt;
@@ -171,7 +171,7 @@ fn along(p: &[(f32, f32)], mut d: f32) -> (f32, f32, f32, f32) {
 }
 
 /// A pipe (hollow tube) along `pts` in flow direction, with an arrow head.
-fn pipe(pm: &mut Pixmap, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, t: f32) {
+fn pipe(pm: &mut dyn Canvas, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, t: f32) {
     let pts = dedupe(pts);
     if pts.len() < 2 {
         return;
@@ -236,7 +236,7 @@ fn pipe(pm: &mut Pixmap, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, t: f
     });
 }
 
-fn tag(pm: &mut Pixmap, f: &Fonts, x: f32, y: f32, align: Align, t: f32) {
+fn tag(pm: &mut dyn Canvas, f: &Fonts, x: f32, y: f32, align: Align, t: f32) {
     let s = 11.0;
     let w = text_width(&f.semi, s, "BOTTLENECK", 0.8) + 8.0;
     let x0 = match align {
@@ -249,7 +249,7 @@ fn tag(pm: &mut Pixmap, f: &Fonts, x: f32, y: f32, align: Align, t: f32) {
     text(pm, &f.semi, s, x0 + 4.0, y, "BOTTLENECK", Color::BLACK, 0.8, Align::Left);
 }
 
-fn rate_text(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, align: Align, s: &str, st: Link, u: f32) {
+fn rate_text(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, align: Align, s: &str, st: Link, u: f32) {
     let c = match st {
         Link::Idle | Link::Unknown => alpha(th.dim, 0.55),
         Link::Flow(_) => th.value,
@@ -261,7 +261,7 @@ fn rate_text(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, align: Alig
 // ---- blocks -----------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn gpu_box(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h: f32, i: u32, g: Option<&GpuNode>, bound: bool, t: f32, u: f32) {
+fn gpu_box(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h: f32, i: u32, g: Option<&GpuNode>, bound: bool, t: f32, u: f32) {
     let busy = g.and_then(|g| g.busy_pct);
     let border = if bound { red() } else { alpha(th.accent, 0.65) };
     let body = rrect_path(x, y, w, h, 5.0 * u.max(0.7));
@@ -306,7 +306,7 @@ fn gpu_box(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h: f3
     text(pm, &f.label, px(11.0, u, 10.0), lx, y + h - 5.0, &format!("VRAM BUSY {}", fmt::pct(busy)), th.dim, 0.5, Align::Left);
 }
 
-fn chip_pins(pm: &mut Pixmap, c: Color, x: f32, y: f32, w: f32, h: f32, n: usize, len: f32) {
+fn chip_pins(pm: &mut dyn Canvas, c: Color, x: f32, y: f32, w: f32, h: f32, n: usize, len: f32) {
     for k in 0..n {
         let fx = x + w * (k as f32 + 1.0) / (n as f32 + 1.0);
         let fy = y + h * (k as f32 + 1.0) / (n as f32 + 1.0);
@@ -319,7 +319,7 @@ fn chip_pins(pm: &mut Pixmap, c: Color, x: f32, y: f32, w: f32, h: f32, n: usize
 
 // ---- data path card -----------------------------------------------------------
 
-pub fn draw_data_path(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, v: &PathView, t: f32) {
+pub fn draw_data_path(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: &PathView, t: f32) {
     let card = lay.top(0);
     let u = lay.ut;
     let ox = card.x + 14.0;
@@ -520,7 +520,7 @@ impl<'a> CpuView<'a> {
     }
 }
 
-pub fn draw_cpu_card(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, v: &CpuView) {
+pub fn draw_cpu_card(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: &CpuView) {
     let b = lay.bot(2);
     let u = lay.ub;
     text(pm, &f.label, px(14.0, u, 10.0), b.x + 14.0, b.y + 70.0 * u, "SYSTEM LOAD", th.text, 1.0, Align::Left);

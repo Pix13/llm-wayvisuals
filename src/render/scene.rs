@@ -4,7 +4,7 @@
 //! positions and all sizes scale with the card height factor `u`, so that
 //! circles and glyphs are never squashed.
 
-use tiny_skia::{Color, PathBuilder, Pixmap};
+use super::canvas::Canvas;
 
 use super::draw::*;
 use super::fmt;
@@ -121,7 +121,7 @@ fn right_info(card: R, g: Gauge) -> (f32, f32) {
 
 // ---- cards ----------------------------------------------------------------
 
-fn card_frame(pm: &mut Pixmap, th: &Theme, r: R, u: f32) {
+fn card_frame(pm: &mut dyn Canvas, th: &Theme, r: R, u: f32) {
     let cut = 14.0 * u.clamp(0.8, 1.1);
     let body = chamfer_path(r.x, r.y, r.w, r.h, cut);
     fill(pm, &body, alpha(th.accent, 0.035));
@@ -148,16 +148,16 @@ fn card_frame(pm: &mut Pixmap, th: &Theme, r: R, u: f32) {
     glow_stroke(pm, &p, alpha(th.bright, 0.9), 2.0, 5.0, 0.07);
 }
 
-fn title_line(pm: &mut Pixmap, th: &Theme, r: R, u: f32) {
+fn title_line(pm: &mut dyn Canvas, th: &Theme, r: R, u: f32) {
     line(pm, r.x + 10.0, r.y + 41.0 * u, r.x + r.w - 10.0, r.y + 41.0 * u, alpha(th.accent, 0.45), 1.0);
 }
 
-fn card_title(pm: &mut Pixmap, th: &Theme, f: &Fonts, r: R, t: &str, u: f32) {
+fn card_title(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, r: R, t: &str, u: f32) {
     text(pm, &f.semi, px(23.0, u, 15.0), r.x + 18.0, r.y + 31.0 * u, t, th.text, 0.8, Align::Left);
     title_line(pm, th, r, u);
 }
 
-pub fn draw_centre_title(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, title: &str, right: Option<&str>) {
+pub fn draw_centre_title(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, title: &str, right: Option<&str>) {
     let r = lay.top(1);
     let sz = px(23.0, lay.ut, 15.0);
     let mut avail = r.w - 40.0;
@@ -173,7 +173,7 @@ pub fn draw_centre_title(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, titl
 
 // ---- icons ------------------------------------------------------------------
 
-fn icon(pm: &mut Pixmap, kind: usize, cx: f32, cy: f32, c: Color) {
+fn icon(pm: &mut dyn Canvas, kind: usize, cx: f32, cy: f32, c: Color) {
     let w = 1.7;
     match kind {
         0 => {
@@ -218,11 +218,11 @@ fn icon(pm: &mut Pixmap, kind: usize, cx: f32, cy: f32, c: Color) {
     }
 }
 
-fn fan(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Color) {
+fn fan(pm: &mut dyn Canvas, cx: f32, cy: f32, r: f32, c: Color) {
     fan_rot(pm, cx, cy, r, c, 0.0);
 }
 
-pub fn fan_rot(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Color, rot: f32) {
+pub fn fan_rot(pm: &mut dyn Canvas, cx: f32, cy: f32, r: f32, c: Color, rot: f32) {
     stroke(pm, &circle_path(cx, cy, r), c, (r * 0.12).max(1.4));
     for k in 0..4 {
         let a = k as f32 * 90.0 + 20.0 + rot;
@@ -239,7 +239,7 @@ pub fn fan_rot(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Color, rot: f32) {
 
 // ---- gauge ------------------------------------------------------------------
 
-fn gauge_static(pm: &mut Pixmap, th: &Theme, f: &Fonts, g: Gauge, label: &str) {
+fn gauge_static(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, g: Gauge, label: &str) {
     let (cx, cy, k) = (g.cx, g.cy, g.k);
     for i in 0..GAUGE_N {
         let (a0, a1) = band_seg(i);
@@ -280,7 +280,7 @@ fn gauge_static(pm: &mut Pixmap, th: &Theme, f: &Fonts, g: Gauge, label: &str) {
     text(pm, &f.semi, sz, cx, by, label, th.value, 1.0, Align::Center);
 }
 
-fn gauge_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, g: Gauge, frac: Option<f32>, sub: &str, t: f32, live: bool) {
+fn gauge_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, g: Gauge, frac: Option<f32>, sub: &str, t: f32, live: bool) {
     let (cx, cy, k) = (g.cx, g.cy, g.k);
     if let Some(fr) = frac {
         let n = (fr.clamp(0.0, 1.0) * GAUGE_N as f32).round() as usize;
@@ -307,25 +307,25 @@ fn gauge_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, g: Gauge, frac: Option<
     text(pm, &f.label, px(13.0, k, 10.0), cx, cy + 26.0 * k, sub, th.dim, 0.5, Align::Center);
 }
 
-fn value_box_static(pm: &mut Pixmap, th: &Theme, f: &Fonts, r: R, label: &str, u: f32) {
+fn value_box_static(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, r: R, label: &str, u: f32) {
     let p = chamfer_path(r.x, r.y, r.w, r.h, 6.0 * u.clamp(0.7, 1.0));
     fill(pm, &p, alpha(th.accent, 0.04));
     stroke(pm, &p, alpha(th.accent, 0.50), 1.2);
     text(pm, &f.label, px(12.0, u, 10.0), r.x + 10.0, r.y + r.h * 0.33, label, th.dim, 1.0, Align::Left);
 }
 
-fn value_box_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, r: R, v: &str, u: f32) {
+fn value_box_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, r: R, v: &str, u: f32) {
     let s = fit_size(&f.semi, px(23.0, u, 15.0), 12.0, v, r.w - 18.0, 0.3);
     text(pm, &f.semi, s, r.x + 10.0, r.y + r.h * 0.80, v, th.value, 0.3, Align::Left);
 }
 
-fn info_header(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, title: &str, u: f32) {
+fn info_header(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, title: &str, u: f32) {
     text(pm, &f.semi, px(14.0, u, 12.0), x + w / 2.0, y + 66.0 * u, title, th.text, 1.2, Align::Center);
     line(pm, x, y + 73.0 * u, x + w, y + 73.0 * u, alpha(th.accent, 0.45), 1.0);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn info_pair(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, w: f32, y: f32, label: &str, v: &str, c: Color, u: f32) {
+fn info_pair(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, w: f32, y: f32, label: &str, v: &str, c: Color, u: f32) {
     let label = clip_text(&f.label, px(11.0, u, 10.0), label, w, 1.2);
     text(pm, &f.label, px(11.0, u, 10.0), x, y, &label, th.dim, 1.2, Align::Left);
     let s = fit_size(&f.semi, px(17.0, u, 14.0), 10.0, v, w, 0.2);
@@ -334,8 +334,8 @@ fn info_pair(pm: &mut Pixmap, th: &Theme, f: &Fonts, x: f32, w: f32, y: f32, lab
 
 // ---- static layer -------------------------------------------------------------
 
-pub fn draw_static(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay) {
-    pm.fill(Color::BLACK);
+pub fn draw_static(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay) {
+    pm.clear(Color::BLACK);
     let u = lay.ut;
     let (l, c, r) = (lay.top(0), lay.top(1), lay.top(2));
     card_frame(pm, th, l, u);
@@ -386,7 +386,7 @@ pub struct Data<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn seg_bar(pm: &mut Pixmap, th: &Theme, x: f32, y: f32, w: f32, h: f32, n: usize, frac: Option<f32>) {
+pub fn seg_bar(pm: &mut dyn Canvas, th: &Theme, x: f32, y: f32, w: f32, h: f32, n: usize, frac: Option<f32>) {
     let gap = 3.0;
     let bw = (w - gap * (n as f32 - 1.0)) / n as f32;
     let lit = frac.map_or(0, |f| {
@@ -423,7 +423,7 @@ fn sum_opt<I: Iterator<Item = Option<f64>>>(it: I) -> Option<f64> {
     any.then_some(s)
 }
 
-pub fn draw_top_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, d: &Data, t: f32, live: bool) {
+pub fn draw_top_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, d: &Data, t: f32, live: bool) {
     let u = lay.ut;
     // ---- right: GPU card = aggregate over the model's GPUs
     // (mean util / clock, total power / VRAM, max temperatures).
@@ -493,7 +493,7 @@ pub fn draw_top_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, d: &D
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bottom_label_value(pm: &mut Pixmap, th: &Theme, f: &Fonts, b: R, y: f32, label: &str, v: &str, size: f32, u: f32) {
+fn bottom_label_value(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, b: R, y: f32, label: &str, v: &str, size: f32, u: f32) {
     text(pm, &f.label, px(13.0, u, 10.0), b.x + 14.0, y, label, th.dim, 1.0, Align::Left);
     text(pm, &f.semi, px(size, u, 14.0), b.x + b.w - 14.0, y, v, th.value, 0.2, Align::Right);
 }
@@ -509,20 +509,20 @@ fn row_fits(b: R, y: f32) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn bar_row(pm: &mut Pixmap, th: &Theme, f: &Fonts, b: R, y: f32, label: &str, fr: Option<f32>, v: &str, u: f32) {
+fn bar_row(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, b: R, y: f32, label: &str, fr: Option<f32>, v: &str, u: f32) {
     text(pm, &f.label, px(14.0, u, 10.0), b.x + 14.0, y, label, th.text, 0.8, Align::Left);
     let bh = (11.0 * u).max(8.0);
     seg_bar(pm, th, b.x + 66.0, y - bh, 142.0, bh, 12, fr);
     text(pm, &f.semi, px(17.0, u, 14.0), b.x + b.w - 14.0, y, v, th.value, 0.2, Align::Right);
 }
 
-fn big_bar_card(pm: &mut Pixmap, th: &Theme, f: &Fonts, b: R, label: &str, pct: Option<f64>, fr: Option<f32>, u: f32) {
+fn big_bar_card(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, b: R, label: &str, pct: Option<f64>, fr: Option<f32>, u: f32) {
     text(pm, &f.label, px(14.0, u, 10.0), b.x + 14.0, b.y + 70.0 * u, label, th.text, 1.0, Align::Left);
     text(pm, &f.semi, px(34.0, u, 22.0), b.x + b.w - 14.0, b.y + 74.0 * u, &fmt::pct(pct), th.value, 0.2, Align::Right);
     seg_bar(pm, th, b.x + 14.0, b.y + 82.0 * u, b.w - 28.0, (15.0 * u).max(9.0), 22, fr);
 }
 
-pub fn draw_bottom_dynamic(pm: &mut Pixmap, th: &Theme, f: &Fonts, lay: &Lay, d: &Data) {
+pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, d: &Data) {
     let u = lay.ub;
     let m = d.model;
     // Below ub = 0.8 the secondary line of MEMORY (FREE) and CONTEXT

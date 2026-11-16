@@ -3,13 +3,19 @@
 //! No dependency on `source` / `history`: the caller passes plain data in a
 //! [`PanelView`]. Static layers (frames, labels, ticks) are cached per theme.
 
+pub mod canvas;
 mod draw;
 mod fmt;
 mod fx;
 mod scene;
+pub mod skia;
+pub mod text;
 mod v2;
 
-use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+use tiny_skia::Pixmap;
+
+pub use canvas::{Canvas, Color, Cov, CovRow, FontFace, FontId, LayerFilter, LayerId, Path, PathBuilder, Seg};
+pub use skia::{SkiaCanvas, SkiaStore};
 
 use crate::model::{ModelSelect, Phase, Snapshot};
 use crate::profile::{self, Cat};
@@ -60,10 +66,15 @@ pub struct Renderer {
     fonts: Fonts,
     rain: Rain,
     dm: DigitMetrics,
-    stat: Option<(&'static str, u32, u32, Pixmap)>,
-    dynlayer: Option<Pixmap>,
+    /// CPU backend state (layers) used by [`Renderer::render`].
+    skia: SkiaStore,
+    /// Instance id of the canvas the cached layers below belong to.
+    owner: Option<u64>,
+    stat: Option<(&'static str, u32, u32, LayerId)>,
+    dynlayer: Option<(u32, u32, LayerId)>,
     /// Dimmed non-live composite (no NO SIGNAL text), reused while the key is unchanged.
-    frozen: Option<(FrozenKey, Pixmap)>,
+    frozen: Option<(FrozenKey, LayerId)>,
+    frozen_size: (u32, u32),
     gen_mask: Option<(String, Mask)>,
     pre_mask: Option<(String, Mask)>,
 }
@@ -95,7 +106,7 @@ impl Renderer {
         let fonts = Fonts::load();
         let rain = Rain::new(&fonts.label);
         let dm = fx::digit_metrics(&fonts.digits);
-        Renderer { fonts, rain, dm, stat: None, dynlayer: None, frozen: None, gen_mask: None, pre_mask: None }
+        Renderer { fonts, rain, dm, skia: SkiaStore::new(), owner: None, stat: None, dynlayer: None, frozen: None, frozen_size: (0, 0), gen_mask: None, pre_mask: None }
     }
 
     /// Renders into `pm`, filling it, natively at any size. All geometry
@@ -106,32 +117,57 @@ impl Renderer {
     /// nothing is squashed. Outside that range (or W outside 960..3840) the
     /// panel is centred with black around it.
     pub fn render(&mut self, pm: &mut Pixmap, view: &PanelView) {
-        let _p = profile::scope(Cat::Render);
         let (w, h) = (pm.width(), pm.height());
+        let mut store = std::mem::take(&mut self.skia);
+        {
+            let mut cv = store.canvas(pm);
+            self.render_canvas(&mut cv, w, h, view);
+        }
+        self.skia = store;
+    }
+
+    /// Backend-neutral entry point: renders a `w` x `h` frame into `cv`'s
+    /// main target (see [`Renderer::render`] for the layout rules). Cached
+    /// layers belong to one canvas instance ([`Canvas::instance_id`]).
+    pub fn render_canvas(&mut self, cv: &mut dyn Canvas, w: u32, h: u32, view: &PanelView) {
+        let _p = profile::scope(Cat::Render);
+        if self.owner != Some(cv.instance_id()) {
+            self.stat = None;
+            self.dynlayer = None;
+            self.frozen = None;
+            self.owner = Some(cv.instance_id());
+        }
         let s = scale_for(w);
         let hd = design_height_for(w, h);
         let ox = (w as f32 - WIDTH as f32 * s) / 2.0;
         let oy = (h as f32 - hd * s) / 2.0;
-        draw::set_view(s, ox, oy);
-        self.render_native(pm, view, hd);
-        draw::set_view(1.0, 0.0, 0.0);
+        cv.set_view(s, ox, oy);
+        self.render_native(cv, w, h, view, hd);
+        cv.set_view(1.0, 0.0, 0.0);
     }
 
-    fn ensure_static(&mut self, th: &Theme, lay: &scene::Lay, w: u32, h: u32) {
-        if self.stat.as_ref().map(|(n, a, b, _)| (*n, *a, *b)) != Some((th.name, w, h)) {
-            let mut p = Pixmap::new(w, h).unwrap();
-            scene::draw_static(&mut p, th, &self.fonts, lay);
-            self.stat = Some((th.name, w, h, p));
+    fn ensure_static(&mut self, cv: &mut dyn Canvas, th: &Theme, lay: &scene::Lay, w: u32, h: u32) -> LayerId {
+        if let Some((n, a, b, id)) = self.stat {
+            if (n, a, b) == (th.name, w, h) {
+                return id;
+            }
+            cv.drop_layer(id);
         }
+        let id = cv.create_layer(w, h);
+        cv.begin_layer(id);
+        scene::draw_static(cv, th, &self.fonts, lay);
+        cv.end_layer();
+        self.stat = Some((th.name, w, h, id));
+        id
     }
 
-    fn render_native(&mut self, pm: &mut Pixmap, view: &PanelView, hd: f32) {
+    fn render_native(&mut self, cv: &mut dyn Canvas, w: u32, h: u32, view: &PanelView, hd: f32) {
         let th = view.theme;
         let lay = scene::Lay::new(hd);
-        self.ensure_static(th, &lay, pm.width(), pm.height());
+        let stat = self.ensure_static(cv, th, &lay, w, h);
         {
             let _p = profile::scope(Cat::StaticBlit);
-            pm.data_mut().copy_from_slice(self.stat.as_ref().unwrap().3.data());
+            cv.layer_copy_in(stat);
         }
 
         let live = view.signal == Signal::Live;
@@ -141,14 +177,14 @@ impl Renderer {
             gpus: view.snapshot.map(|s| s.gpus_of(model)).unwrap_or_default(),
         };
         if live {
-            self.draw_dynamic(pm, view, &data, &lay, true, view.t);
+            self.draw_dynamic(cv, view, &data, &lay, true, view.t);
             let _p = profile::scope(Cat::Overlay);
             let right = self.title_right(view, &data);
-            scene::draw_centre_title(pm, th, &self.fonts, &lay, &self.title_of(view, &data), right.as_deref());
+            scene::draw_centre_title(cv, th, &self.fonts, &lay, &self.title_of(view, &data), right.as_deref());
         } else {
             let key = FrozenKey {
                 theme: th.name,
-                size: (pm.width(), pm.height()),
+                size: (w, h),
                 snap: view.snapshot.cloned(),
                 sel: view.model.clone(),
                 title: view.title.map(str::to_string),
@@ -157,40 +193,50 @@ impl Renderer {
                 cpu_wave: view.cpu_wave.to_vec(),
             };
             if self.frozen.as_ref().map(|(k, _)| k) != Some(&key) {
-                let img = self.build_frozen(pm, view, &data, &lay);
-                self.frozen = Some((key, img));
+                let id = match self.frozen.take() {
+                    Some((_, id)) if self.frozen_size == (w, h) => id,
+                    Some((_, id)) => {
+                        cv.drop_layer(id);
+                        cv.create_layer(w, h)
+                    }
+                    None => cv.create_layer(w, h),
+                };
+                self.frozen_size = (w, h);
+                self.build_frozen(cv, view, &data, &lay, id);
+                self.frozen = Some((key, id));
             }
             let _p = profile::scope(Cat::Overlay);
-            pm.data_mut().copy_from_slice(self.frozen.as_ref().unwrap().1.data());
-            self.draw_no_signal(pm, view, &lay);
+            cv.layer_copy_in(self.frozen.as_ref().unwrap().1);
+            self.draw_no_signal(cv, view, &lay);
         }
     }
 
     /// Dimmed composite: frames at ~50 %, dynamic content at ~28 %,
-    /// desaturated; the matrix rain is frozen at a fixed time. `pm` holds
-    /// the static layer on entry (its pixels are overwritten by the caller).
-    fn build_frozen(&mut self, pm: &mut Pixmap, view: &PanelView, data: &scene::Data, lay: &scene::Lay) -> Pixmap {
+    /// desaturated; the matrix rain is frozen at a fixed time. The target
+    /// holds the static layer on entry; the result is captured into `out`.
+    fn build_frozen(&mut self, cv: &mut dyn Canvas, view: &PanelView, data: &scene::Data, lay: &scene::Lay, out: LayerId) {
         let th = view.theme;
-        draw::fill_all(pm, Color::from_rgba(0.0, 0.0, 0.0, 0.5).unwrap());
-        let mut d = match self.dynlayer.take() {
-            Some(p) if p.height() == pm.height() => p,
-            _ => Pixmap::new(pm.width(), pm.height()).unwrap(),
-        };
-        d.fill(Color::TRANSPARENT);
-        self.draw_dynamic(&mut d, view, data, lay, false, 1.5);
-        for px in d.data_mut().chunks_exact_mut(4) {
-            let g = px[0] as f32 * 0.30 + px[1] as f32 * 0.59 + px[2] as f32 * 0.11;
-            for c in &mut px[..3] {
-                *c = ((*c as f32 * 0.35 + g * 0.65) * 0.28) as u8;
+        let (w, h) = cv.size();
+        draw::fill_all(cv, Color::from_rgba(0.0, 0.0, 0.0, 0.5).unwrap());
+        let d = match self.dynlayer.take() {
+            Some((dw, dh, id)) if (dw, dh) == (w, h) => id,
+            Some((_, _, id)) => {
+                cv.drop_layer(id);
+                cv.create_layer(w, h)
             }
-            px[3] = (px[3] as f32 * 0.28) as u8;
-        }
-        pm.draw_pixmap(0, 0, d.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-        self.dynlayer = Some(d);
+            None => cv.create_layer(w, h),
+        };
+        cv.begin_layer(d);
+        cv.clear(Color::TRANSPARENT);
+        self.draw_dynamic(cv, view, data, lay, false, 1.5);
+        cv.end_layer();
+        cv.layer_filter(d, LayerFilter::Dim { keep: 0.35, greyw: 0.65, gain: 0.28 });
+        cv.layer_blit(d, 0, 0);
+        self.dynlayer = Some((w, h, d));
         let mut th2 = th.clone();
         th2.text = alpha(th.text, 0.5);
-        scene::draw_centre_title(pm, &th2, &self.fonts, lay, &self.title_of(view, data), self.title_right(view, data).as_deref());
-        pm.clone()
+        scene::draw_centre_title(cv, &th2, &self.fonts, lay, &self.title_of(view, data), self.title_right(view, data).as_deref());
+        cv.layer_capture(out);
     }
 
     /// Right part of the title bar: `QUANT · HOST` (`--` when absent).
@@ -216,7 +262,7 @@ impl Renderer {
         }
     }
 
-    fn draw_dynamic(&mut self, pm: &mut Pixmap, view: &PanelView, data: &scene::Data, lay: &scene::Lay, live: bool, t: f32) {
+    fn draw_dynamic(&mut self, pm: &mut dyn Canvas, view: &PanelView, data: &scene::Data, lay: &scene::Lay, live: bool, t: f32) {
         let th = view.theme;
         {
             let _p = profile::scope(Cat::TopCards);
@@ -261,7 +307,7 @@ impl Renderer {
         m
     }
 
-    fn draw_centre(&mut self, pm: &mut Pixmap, view: &PanelView, d: &scene::Data, lay: &scene::Lay, live: bool, t: f32) {
+    fn draw_centre(&mut self, pm: &mut dyn Canvas, view: &PanelView, d: &scene::Data, lay: &scene::Lay, live: bool, t: f32) {
         use scene::px;
         let th = view.theme;
         let f = &self.fonts;
@@ -286,14 +332,15 @@ impl Renderer {
                 Some(v) if v == 0.0 && phase != Some(Phase::Decode) => gen_s.len(),
                 _ => fmt::ghost_zeros(&gen_s),
             };
-            let vs = draw::view().0;
+            let vs = pm.view().0;
             let gm = Self::mask(&mut self.gen_mask, f, self.dm, &gen_s, gen_ghost, 76.0 * u * vs);
             let cx = c.x + 376.0;
-            let right = draw::tx(cx) + gm.w as f32 / 2.0;
+            let right = draw::tx(pm, cx) + gm.w as f32 / 2.0;
             let base = c.y + 128.0 * u;
             let top = mix(th.accent, Color::WHITE, 0.5);
             let bot = th.accent;
-            fx::draw_digits(pm, &gm, (draw::tx(cx) - gm.w as f32 / 2.0) as i32, (draw::ty(base) - gm.base as f32) as i32, top, bot, th.accent, (22.0 * u * vs) as usize, 1.0);
+            let (gx, gy) = ((draw::tx(pm, cx) - gm.w as f32 / 2.0) as i32, (draw::ty(pm, base) - gm.base as f32) as i32);
+            fx::draw_digits(pm, &gm, gx, gy, top, bot, th.accent, (22.0 * u * vs) as usize, 1.0);
             draw::text(pm, &f.semi, px(30.0, u, 20.0), c.x + 28.0, base - 30.0 * u, "GEN", th.value, 2.0, Align::Left);
             draw::text(pm, &f.label, px(14.0, u, 10.0), c.x + 28.0, base - 10.0 * u, "TOK/S", th.dim, 2.0, Align::Left);
 
@@ -303,7 +350,8 @@ impl Renderer {
             let pre_ghost = if pv.is_none() { pre_s.len() } else { fmt::ghost_zeros(&pre_s) };
             let pmk = Self::mask(&mut self.pre_mask, f, self.dm, &pre_s, pre_ghost, 42.0 * u * vs);
             let base2 = c.y + 200.0 * u;
-            fx::draw_digits(pm, &pmk, (right - pmk.w as f32) as i32, (draw::ty(base2) - pmk.base as f32) as i32, top, bot, th.accent, (14.0 * u * vs) as usize, 1.0);
+            let py = (draw::ty(pm, base2) - pmk.base as f32) as i32;
+            fx::draw_digits(pm, &pmk, (right - pmk.w as f32) as i32, py, top, bot, th.accent, (14.0 * u * vs) as usize, 1.0);
             draw::text(pm, &f.semi, px(20.0, u, 14.0), c.x + 28.0, base2 - 16.0 * u, "PREFILL", th.value, 1.5, Align::Left);
             draw::text(pm, &f.label, px(12.0, u, 10.0), c.x + 28.0, base2, "TOK/S", th.dim, 2.0, Align::Left);
         }
@@ -323,7 +371,7 @@ impl Renderer {
         fx::draw_wave(pm, th, view.wave, view.wave_max, c.x + 230.0, c.y + 230.0 * u, c.w - 230.0 - 28.0, (34.0 * u).max(22.0), 1.0);
     }
 
-    fn draw_no_signal(&mut self, pm: &mut Pixmap, view: &PanelView, lay: &scene::Lay) {
+    fn draw_no_signal(&mut self, pm: &mut dyn Canvas, view: &PanelView, lay: &scene::Lay) {
         use scene::px;
         let c = lay.top(1);
         let u = lay.ut;
@@ -452,12 +500,40 @@ mod stack_tests {
             ("stack-2", ["synthetic-v2-A", "synthetic-v2-E"].as_slice(), 508),
         ] {
             let mut full = Pixmap::new(1920, hb * list.len() as u32).unwrap();
-            full.fill(Color::BLACK);
+            full.fill(tiny_skia::Color::BLACK);
             for (k, fx) in list.iter().enumerate() {
                 let band = frame(&mut r, fx, ["green", "blue", "purple"][k], 1920, hb);
-                full.draw_pixmap(0, (hb * k as u32) as i32, band.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                full.draw_pixmap(0, (hb * k as u32) as i32, band.as_ref(), &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
             }
             full.save_png(format!("{dir}/v2-{name}.png")).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod layer_cache_tests {
+    use super::*;
+
+    /// The cached layers (static, frozen, dim scratch) must give the same
+    /// pixels on a cache hit as on a miss, across sizes and signals.
+    #[test]
+    fn cached_frames_equal_fresh_frames() {
+        let snap = Snapshot::parse(include_str!("../fixtures/synthetic-v2-A.json")).unwrap();
+        let th = crate::theme::theme("green").unwrap();
+        let sel = ModelSelect::Auto;
+        let mk = |signal: Signal| PanelView {
+            snapshot: Some(&snap), model: &sel, signal, theme: &th, title: None,
+            wave: &[], wave_max: None, cpu_wave: &[], t: 2.0,
+        };
+        let mut shared = Renderer::new();
+        for (w, h) in [(1920, 480), (1920, 348), (1920, 480)] {
+            for sig in [Signal::Stale { age_s: 3.0 }, Signal::Live, Signal::Stale { age_s: 3.0 }] {
+                let mut a = Pixmap::new(w, h).unwrap();
+                let mut b = Pixmap::new(w, h).unwrap();
+                shared.render(&mut a, &mk(sig.clone()));
+                Renderer::new().render(&mut b, &mk(sig.clone()));
+                assert!(a.data() == b.data(), "{w}x{h} {sig:?}");
+            }
         }
     }
 }

@@ -1,71 +1,22 @@
-//! Low-level drawing helpers over tiny-skia + ab_glyph.
+//! Drawing helpers over the backend-neutral [`Canvas`]: path constructors,
+//! strokes with glow, rectangles and aligned text. Text measuring lives in
+//! `text.rs` (re-exported here).
 
-use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont, VariableFont};
-use tiny_skia::{
-    Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
-};
 
+use super::canvas::Canvas;
+pub use super::canvas::{Color, FontFace, Path, PathBuilder};
+pub use super::text::{cap, clip_text, fit_size, text_width, Fonts};
 use crate::theme::alpha;
 
-thread_local! {
-    static VIEW: std::cell::Cell<(f32, f32, f32)> = const { std::cell::Cell::new((1.0, 0.0, 0.0)) };
-}
-
-/// Sets the design -> pixel mapping used by every primitive below:
-/// `pixel = design * s + (ox, oy)`.
-pub fn set_view(s: f32, ox: f32, oy: f32) {
-    VIEW.with(|v| v.set((s, ox, oy)));
-}
-
-pub fn view() -> (f32, f32, f32) {
-    VIEW.with(|v| v.get())
-}
-
-pub fn tr() -> Transform {
-    let (s, ox, oy) = view();
-    if s == 1.0 && ox == 0.0 && oy == 0.0 {
-        Transform::identity()
-    } else {
-        Transform::from_row(s, 0.0, 0.0, s, ox, oy)
-    }
-}
-
-pub fn tx(x: f32) -> f32 {
-    let (s, ox, _) = view();
+/// `pixel = design * s + (ox, oy)` as set on the canvas.
+pub fn tx(c: &dyn Canvas, x: f32) -> f32 {
+    let (s, ox, _) = c.view();
     x * s + ox
 }
 
-pub fn ty(y: f32) -> f32 {
-    let (s, _, oy) = view();
+pub fn ty(c: &dyn Canvas, y: f32) -> f32 {
+    let (s, _, oy) = c.view();
     y * s + oy
-}
-
-pub struct Fonts {
-    /// Rajdhani Medium: labels, small text.
-    pub label: FontRef<'static>,
-    /// Rajdhani SemiBold: titles, values.
-    pub semi: FontRef<'static>,
-    /// Oxanium (variable, wght 700): giant digits.
-    pub digits: FontRef<'static>,
-}
-
-impl Fonts {
-    pub fn load() -> Self {
-        let label = FontRef::try_from_slice(include_bytes!(
-            "../../assets/fonts/rajdhani/Rajdhani-Medium.ttf"
-        ))
-        .expect("Rajdhani-Medium");
-        let semi = FontRef::try_from_slice(include_bytes!(
-            "../../assets/fonts/rajdhani/Rajdhani-SemiBold.ttf"
-        ))
-        .expect("Rajdhani-SemiBold");
-        let mut digits = FontRef::try_from_slice(include_bytes!(
-            "../../assets/fonts/oxanium/Oxanium-VF.ttf"
-        ))
-        .expect("Oxanium");
-        digits.set_variation(b"wght", 700.0);
-        Fonts { label, semi, digits }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,13 +24,6 @@ pub enum Align {
     Left,
     Center,
     Right,
-}
-
-pub fn paint(c: Color) -> Paint<'static> {
-    let mut p = Paint::default();
-    p.set_color(c);
-    p.anti_alias = true;
-    p
 }
 
 // ---- paths -------------------------------------------------------------
@@ -165,92 +109,42 @@ pub fn polar(cx: f32, cy: f32, r: f32, a_deg: f32) -> (f32, f32) {
 
 // ---- fill / stroke -----------------------------------------------------
 
-pub fn fill(pm: &mut Pixmap, p: &Path, c: Color) {
-    pm.fill_path(p, &paint(c), FillRule::Winding, tr(), None);
+pub fn fill(pm: &mut dyn Canvas, p: &Path, c: Color) {
+    pm.fill_path(p, c);
 }
 
-pub fn stroke(pm: &mut Pixmap, p: &Path, c: Color, w: f32) {
-    let s = Stroke {
-        width: w,
-        ..Stroke::default()
-    };
-    pm.stroke_path(p, &paint(c), &s, tr(), None);
+pub fn stroke(pm: &mut dyn Canvas, p: &Path, c: Color, w: f32) {
+    pm.stroke_path(p, c, w);
 }
 
 /// Cheap glow: a wide low-alpha stroke under the real one.
-pub fn glow_stroke(pm: &mut Pixmap, p: &Path, c: Color, w: f32, glow_w: f32, glow_a: f32) {
+pub fn glow_stroke(pm: &mut dyn Canvas, p: &Path, c: Color, w: f32, glow_w: f32, glow_a: f32) {
     stroke(pm, p, alpha(c, glow_a), glow_w);
     stroke(pm, p, alpha(c, glow_a * 1.8), (glow_w + w) * 0.5);
     stroke(pm, p, c, w);
 }
 
-pub fn line(pm: &mut Pixmap, x0: f32, y0: f32, x1: f32, y1: f32, c: Color, w: f32) {
+pub fn line(pm: &mut dyn Canvas, x0: f32, y0: f32, x1: f32, y1: f32, c: Color, w: f32) {
     stroke(pm, &line_path(x0, y0, x1, y1), c, w);
 }
 
-pub fn rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color) {
-    if let Some(r) = Rect::from_xywh(x, y, w, h) {
-        let mut p = paint(c);
-        let t = tr();
-        p.anti_alias = !t.is_identity();
-        pm.fill_rect(r, &p, t, None);
-    }
+/// Rectangle, anti-aliased only when the view is not the identity (so that
+/// 1:1 rendering stays pixel-exact).
+pub fn rect(pm: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) {
+    let aa = pm.view() != (1.0, 0.0, 0.0);
+    pm.fill_rect(x, y, w, h, c, aa);
 }
 
-/// Fills the whole pixmap (pixel space, ignores the view).
-pub fn fill_all(pm: &mut Pixmap, c: Color) {
-    let r = Rect::from_xywh(0.0, 0.0, pm.width() as f32, pm.height() as f32).unwrap();
-    let mut p = paint(c);
-    p.anti_alias = false;
-    pm.fill_rect(r, &p, Transform::identity(), None);
+/// Blends `c` over the whole target (pixel space, ignores the view).
+pub fn fill_all(pm: &mut dyn Canvas, c: Color) {
+    pm.overlay(c);
 }
 
-pub fn rect_aa(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Color) {
-    if let Some(r) = Rect::from_xywh(x, y, w, h) {
-        pm.fill_rect(r, &paint(c), tr(), None);
-    }
+pub fn rect_aa(pm: &mut dyn Canvas, x: f32, y: f32, w: f32, h: f32, c: Color) {
+    pm.fill_rect(x, y, w, h, c, true);
 }
 
 // ---- text --------------------------------------------------------------
-
-/// Hard cap on the characters of any displayed string (server-controlled
-/// text must not make a frame slow). Cuts on a char boundary.
-pub const MAX_CHARS: usize = 256;
-
-pub fn cap(s: &str) -> &str {
-    match s.char_indices().nth(MAX_CHARS) {
-        Some((i, _)) => &s[..i],
-        None => s,
-    }
-}
-
-pub fn text_width(font: &FontRef, size: f32, s: &str, tracking: f32) -> f32 {
-    let s = cap(s);
-    let sc = font.as_scaled(PxScale::from(size));
-    let mut w = 0.0;
-    let mut prev = None;
-    for ch in s.chars() {
-        let g = sc.glyph_id(ch);
-        if let Some(p) = prev {
-            w += sc.kern(p, g);
-        }
-        w += sc.h_advance(g) + tracking;
-        prev = Some(g);
-    }
-    (w - tracking).max(0.0)
-}
-
-#[inline]
-pub fn blend_px(d: &mut [u8], c: [f32; 3], a: f32) {
-    if a <= 0.0 {
-        return;
-    }
-    let ia = 1.0 - a;
-    d[0] = (c[0] * a + d[0] as f32 * ia) as u8;
-    d[1] = (c[1] * a + d[1] as f32 * ia) as u8;
-    d[2] = (c[2] * a + d[2] as f32 * ia) as u8;
-    d[3] = (255.0 * a + d[3] as f32 * ia) as u8;
-}
 
 pub fn rgb255(c: Color) -> [f32; 3] {
     [c.red() * 255.0, c.green() * 255.0, c.blue() * 255.0]
@@ -259,8 +153,8 @@ pub fn rgb255(c: Color) -> [f32; 3] {
 /// Draws `s` with its baseline at `base_y`. Returns the drawn width.
 #[allow(clippy::too_many_arguments)]
 pub fn text(
-    pm: &mut Pixmap,
-    font: &FontRef,
+    pm: &mut dyn Canvas,
+    font: &FontFace,
     size: f32,
     x: f32,
     base_y: f32,
@@ -276,94 +170,17 @@ pub fn text(
         Align::Center => x - w / 2.0,
         Align::Right => x - w,
     };
-    let (vs, _, _) = view();
-    let scale = PxScale::from(size * vs);
-    let sc = font.as_scaled(scale);
-    let (tracking, base_y) = (tracking * vs, ty(base_y));
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
-    let rgb = rgb255(color);
-    let ca = color.alpha();
-    let data = pm.data_mut();
-    let mut caret = tx(x0);
-    let mut prev = None;
-    for ch in s.chars() {
-        let id = sc.glyph_id(ch);
-        if let Some(p) = prev {
-            caret += sc.kern(p, id);
-        }
-        let g = id.with_scale_and_position(scale, point(caret, base_y));
-        if let Some(og) = font.outline_glyph(g) {
-            let b = og.px_bounds();
-            let (bx, by) = (b.min.x as i32, b.min.y as i32);
-            og.draw(|gx, gy, cov| {
-                let (px, py) = (bx + gx as i32, by + gy as i32);
-                if px >= 0 && py >= 0 && px < pw && py < ph {
-                    let i = ((py * pw + px) * 4) as usize;
-                    blend_px(&mut data[i..i + 4], rgb, cov * ca);
-                }
-            });
-        }
-        caret += sc.h_advance(id) + tracking;
-        prev = Some(id);
-    }
+    pm.text_run(font, size, x0, base_y, s, color, tracking);
     w
-}
-
-/// Largest size <= `size` (down to `min`) at which `s` fits in `max_w`.
-pub fn fit_size(font: &FontRef, size: f32, min: f32, s: &str, max_w: f32, tracking: f32) -> f32 {
-    let w = text_width(font, size, s, tracking);
-    if w <= max_w || w <= 0.0 {
-        size
-    } else {
-        (size * max_w / w).max(min)
-    }
-}
-
-/// Truncates with an ellipsis so that it fits `max_w`. Linear time: glyph
-/// advances are accumulated once (strings are capped at [`MAX_CHARS`]).
-pub fn clip_text(font: &FontRef, size: f32, s: &str, max_w: f32, tracking: f32) -> String {
-    let capped = cap(s);
-    if capped.len() == s.len() && text_width(font, size, capped, tracking) <= max_w {
-        return s.to_string();
-    }
-    let sc = font.as_scaled(PxScale::from(size));
-    let ell = sc.glyph_id('…');
-    let ell_adv = sc.h_advance(ell);
-    // (byte offset of the char, width of the prefix before it incl. trailing tracking, its glyph)
-    let mut pre: Vec<(usize, f32, ab_glyph::GlyphId)> = Vec::new();
-    let mut cum = 0.0f32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
-    for (i, ch) in capped.char_indices() {
-        let g = sc.glyph_id(ch);
-        if let Some(p) = prev {
-            cum += sc.kern(p, g);
-        }
-        pre.push((i, cum, g));
-        cum += sc.h_advance(g) + tracking;
-        prev = Some(g);
-    }
-    // keep the first k chars: width = prefix(k) + kern(last, …) + adv(…)
-    let n = pre.len();
-    let last_k = if capped.len() == s.len() { n.saturating_sub(1) } else { n };
-    for k in (0..=last_k).rev() {
-        let w = if k == 0 {
-            ell_adv
-        } else {
-            let (_, c, g) = pre[k - 1];
-            // pre[k-1].1 is the prefix before char k-1; add that char's own advance
-            c + sc.h_advance(g) + tracking + sc.kern(g, ell) + ell_adv
-        };
-        if w <= max_w {
-            let end = if k == n { capped.len() } else { pre[k].0 };
-            return format!("{}…", &capped[..end]);
-        }
-    }
-    String::new()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::skia::SkiaStore;
+    use ab_glyph::FontRef;
+    use super::super::text::MAX_CHARS;
     use super::*;
+    use tiny_skia::Pixmap;
 
     fn old_clip(font: &FontRef, size: f32, s: &str, max_w: f32, tracking: f32) -> String {
         if text_width(font, size, s, tracking) <= max_w {
@@ -402,7 +219,9 @@ mod tests {
         assert!(c.chars().count() <= MAX_CHARS + 1 && c.ends_with('…'));
         assert!(w > 0.0);
         let mut pm = Pixmap::new(64, 64).unwrap();
-        text(&mut pm, &f.semi, 12.0, 0.0, 20.0, &big, Color::WHITE, 0.0, Align::Left);
+        let mut store = SkiaStore::new();
+        let mut cv = store.canvas(&mut pm);
+        text(&mut cv, &f.semi, 12.0, 0.0, 20.0, &big, Color::WHITE, 0.0, Align::Left);
         assert!(t0.elapsed().as_millis() < 500, "took {:?}", t0.elapsed());
         assert_eq!(cap(&big).chars().count(), MAX_CHARS);
     }

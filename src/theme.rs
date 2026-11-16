@@ -1,6 +1,6 @@
 //! Colour themes of the panel (accent colours sampled from the reference).
 
-use tiny_skia::Color;
+use crate::render::Color;
 
 /// Red is reserved for the bottleneck highlight.
 pub const THEMES: [&str; 4] = ["green", "gold", "purple", "blue"];
