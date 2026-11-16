@@ -53,9 +53,17 @@ pub enum Cat {
     GlSubmit,
     /// GPU path: `swap_buffers`.
     GlSwap,
+    /// GPU path: vector fills / strokes / rects handed to femtovg (recording).
+    GlVector,
+    /// GPU path: text runs (glyph atlas lookups + quads).
+    GlText,
+    /// GPU path: coverage blits (rain, digits).
+    GlCov,
+    /// GPU path: static layer restores.
+    GlRestore,
 }
 
-const CATS: [(Cat, &str); 19] = [
+const CATS: [(Cat, &str); 23] = [
     (Cat::Tick, "tick/feed"),
     (Cat::Frame, "frame (redraw)"),
     (Cat::Render, "render"),
@@ -75,6 +83,10 @@ const CATS: [(Cat, &str); 19] = [
     (Cat::Present, "present"),
     (Cat::GlSubmit, "gl submit"),
     (Cat::GlSwap, "gl swap"),
+    (Cat::GlVector, "  gl vector ops"),
+    (Cat::GlText, "  gl text ops"),
+    (Cat::GlCov, "  gl cov ops"),
+    (Cat::GlRestore, "  gl restore"),
 ];
 
 static STATE: AtomicU8 = AtomicU8::new(0); // 0 unknown, 1 off, 2 on, 3 on + tiles

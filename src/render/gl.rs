@@ -131,6 +131,16 @@ impl GpuRenderer {
         r.render_canvas(&mut self.store, w, h, view);
     }
 
+    /// Like [`GpuRenderer::render_band`], but repaints only what changed since
+    /// the previous call for this band (its image persists). The returned
+    /// [`Damage`](crate::render::Damage) is empty (and not full) when nothing
+    /// changed: then there is nothing to present for this band.
+    pub fn render_band_incremental(&mut self, band: usize, r: &mut Renderer, w: u32, h: u32, view: &PanelView) -> crate::render::Damage {
+        let _ = self.ctx.make_current();
+        self.store.begin_frame(band, w, h);
+        r.render_incremental_on(&mut self.store, w, h, view)
+    }
+
     /// Sends the recorded commands to the driver.
     pub fn submit(&mut self) {
         let _p = crate::profile::scope(crate::profile::Cat::GlSubmit);
@@ -145,6 +155,11 @@ impl GpuRenderer {
     /// Top-down premultiplied RGBA of the last frame: `(w, h, bytes)`.
     pub fn read_rgba(&mut self) -> Option<(u32, u32, Vec<u8>)> {
         self.store.read_frame(0)
+    }
+
+    /// Top-down premultiplied RGBA of band `band`'s image.
+    pub fn read_band_rgba(&mut self, band: usize) -> Option<(u32, u32, Vec<u8>)> {
+        self.store.read_frame(band)
     }
 
     /// Last frame as a tiny-skia pixmap.

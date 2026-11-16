@@ -14,6 +14,8 @@ use femtovg::{
 };
 use glow::HasContext;
 
+use crate::profile::{self, Cat};
+use crate::render::incr::{IRect, RectCanvas};
 use crate::render::canvas::{Canvas, Color, Cov, CovRow, FontFace, FontId, LayerFilter, LayerId, Path, Seg};
 
 use ab_glyph::{point, Font, PxScale, ScaleFont};
@@ -88,6 +90,8 @@ pub struct GlStore {
     /// Frame images by band index; `cur_frame` is the one being drawn.
     frames: Vec<Option<Layer>>,
     cur_frame: usize,
+    /// Clip of the draw operations ([`RectCanvas::set_clip`]), exact via scissor.
+    clip: Option<IRect>,
     stack: Vec<Target>,
     cov: HashMap<(u32, u32, u64), CovEntry>,
     frame_no: u64,
@@ -126,6 +130,7 @@ impl GlStore {
             layers: Vec::new(),
             frames: Vec::new(),
             cur_frame: 0,
+            clip: None,
             stack: Vec::new(),
             cov: HashMap::new(),
             frame_no: 0,
@@ -250,6 +255,24 @@ impl GlStore {
         }
     }
 
+    /// Sets the scissor to the active clip intersected with `extra`
+    /// (pixel space). Leaves the transform identity.
+    fn apply_clip(&mut self, extra: Option<(i32, i32, i32, i32)>) {
+        self.cv.reset_transform();
+        self.cv.reset_scissor();
+        let mut r = self.clip.map(|c| (c.x0, c.y0, c.x1, c.y1));
+        if let Some((a0, b0, a1, b1)) = extra {
+            r = Some(match r {
+                Some((x0, y0, x1, y1)) => (x0.max(a0), y0.max(b0), x1.min(a1), y1.min(b1)),
+                None => (a0, b0, a1, b1),
+            });
+        }
+        if let Some((x0, y0, x1, y1)) = r {
+            // an empty intersection still has to clip everything
+            self.cv.scissor(x0 as f32, y0 as f32, (x1 - x0).max(0) as f32, (y1 - y0).max(0) as f32);
+        }
+    }
+
     fn set_view_transform(&mut self) {
         let (s, ox, oy) = self.view;
         self.cv.set_transform(&Transform2D::new(s, 0.0, 0.0, s, ox, oy));
@@ -362,6 +385,7 @@ impl GlStore {
     fn draw_image(&mut self, id: ImageId, x: i32, y: i32, w: u32, h: u32, op: CompositeOperation) {
         self.cv.save();
         self.cv.reset_transform();
+        self.cv.reset_scissor();
         self.cv.global_composite_operation(op);
         let paint = Paint::image(id, x as f32, y as f32, w as f32, h as f32, 0.0, 1.0).with_anti_alias(false);
         self.cv.fill_path(&Self::rect_path(x as f32, y as f32, w as f32, h as f32), &paint);
@@ -400,6 +424,8 @@ impl Canvas for GlStore {
     }
 
     fn fill_path(&mut self, p: &Path, c: Color) {
+        let _p = profile::scope(Cat::GlVector);
+        self.apply_clip(None);
         self.set_view_transform();
         let mut paint = Paint::color(fc(c)).with_anti_alias(true);
         paint.set_fill_rule(FillRule::NonZero);
@@ -407,6 +433,8 @@ impl Canvas for GlStore {
     }
 
     fn stroke_path(&mut self, p: &Path, c: Color, w: f32) {
+        let _p = profile::scope(Cat::GlVector);
+        self.apply_clip(None);
         self.set_view_transform();
         let mut paint = Paint::color(fc(c)).with_anti_alias(true);
         paint.set_line_width(w);
@@ -417,9 +445,11 @@ impl Canvas for GlStore {
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color, aa: bool) {
+        let _p = profile::scope(Cat::GlVector);
         if !(w > 0.0 && h > 0.0 && x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) {
             return;
         }
+        self.apply_clip(None);
         if aa {
             self.set_view_transform();
             let paint = Paint::color(fc(c)).with_anti_alias(true);
@@ -441,7 +471,7 @@ impl Canvas for GlStore {
 
     fn overlay(&mut self, c: Color) {
         let (w, h) = self.cur_size();
-        self.cv.reset_transform();
+        self.apply_clip(None);
         let paint = Paint::color(fc(c)).with_anti_alias(false);
         self.cv.fill_path(&Self::rect_path(0.0, 0.0, w as f32, h as f32), &paint);
     }
@@ -453,6 +483,7 @@ impl Canvas for GlStore {
     }
 
     fn text_run(&mut self, font: &FontFace, size: f32, x: f32, base_y: f32, s: &str, color: Color, tracking: f32) {
+        let _p = profile::scope(Cat::GlText);
         let (vs, ox, oy) = self.view;
         let scale = PxScale::from(size * vs);
         let sc = font.as_scaled(scale);
@@ -503,7 +534,7 @@ impl Canvas for GlStore {
         if quads.is_empty() {
             return;
         }
-        self.cv.reset_transform();
+        self.apply_clip(None);
         let paint = Paint::color(fc(color));
         self.cv.draw_glyph_commands(
             GlyphDrawCommands { alpha_glyphs: vec![DrawCommand { image_id: atlas, quads }], color_glyphs: Vec::new() },
@@ -512,29 +543,26 @@ impl Canvas for GlStore {
     }
 
     fn blit_cov(&mut self, cov: &Cov, x: i32, y: i32, rgb: [f32; 3], a: f32, clip: Option<(i32, i32, i32, i32)>) {
+        let _p = profile::scope(Cat::GlCov);
         if a <= 0.0 {
             return;
         }
         let Some(id) = self.cov_image(cov) else { return };
-        self.cv.save();
-        self.cv.reset_transform();
-        if let Some((x0, y0, x1, y1)) = clip {
-            if x1 <= x0 || y1 <= y0 {
-                self.cv.restore();
-                return;
-            }
-            self.cv.scissor(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
-        }
-        let (w, h) = (cov.w as f32, cov.h as f32);
-        let paint = Paint::image_tint(id, x as f32, y as f32, w, h, 0.0, fc_rgb(rgb, a)).with_anti_alias(false);
-        self.cv.fill_path(&Self::rect_path(x as f32, y as f32, w, h), &paint);
-        self.cv.restore();
+        self.apply_clip(clip);
+        // one textured quad through the glyph path (no path tessellation)
+        let paint = Paint::color(fc_rgb(rgb, a));
+        let (x0, y0) = (x as f32, y as f32);
+        let quad = Quad { x0, y0, s0: 0.0, t0: 0.0, x1: x0 + cov.w as f32, y1: y0 + cov.h as f32, s1: 1.0, t1: 1.0 };
+        self.cv.draw_glyph_commands(
+            GlyphDrawCommands { alpha_glyphs: vec![DrawCommand { image_id: id, quads: vec![quad] }], color_glyphs: Vec::new() },
+            &paint,
+        );
     }
 
     fn blit_cov_rows(&mut self, cov: &Cov, x: i32, rows: &[CovRow]) {
+        let _p = profile::scope(Cat::GlCov);
         let Some(id) = self.cov_image(cov) else { return };
-        self.cv.save();
-        self.cv.reset_transform();
+        self.apply_clip(None);
         let (w, h) = (cov.w as f32, cov.h as f32);
         for r in rows {
             if r.a <= 0.0 || r.src_row >= cov.h {
@@ -545,7 +573,6 @@ impl Canvas for GlStore {
             let paint = Paint::image_tint(id, x as f32, top, w, h, 0.0, fc_rgb(r.rgb, r.a)).with_anti_alias(false);
             self.cv.fill_path(&Self::rect_path(x as f32, r.dst_y as f32, w, 1.0), &paint);
         }
-        self.cv.restore();
     }
 
     fn create_layer(&mut self, w: u32, h: u32) -> LayerId {
@@ -630,4 +657,50 @@ impl Canvas for GlStore {
         let src = ImgRef::new(px.as_rgba() as &[RGBA8], w as usize, h as usize);
         let _ = self.cv.update_image(img, ImageSource::Rgba(src), 0, 0);
     }
+}
+
+impl RectCanvas for GlStore {
+    fn merge_tuning(&self) -> (u32, usize) {
+        gpu_merge_tuning()
+    }
+
+    fn layer_copy_rect(&mut self, id: LayerId, r: &IRect) {
+        let _p = profile::scope(Cat::GlRestore);
+        let (img, w, h) = self.layer_ref(id);
+        let r = IRect { x0: r.x0.clamp(0, w as i32), y0: r.y0.clamp(0, h as i32), x1: r.x1.clamp(0, w as i32), y1: r.y1.clamp(0, h as i32) };
+        if r.is_empty() {
+            return;
+        }
+        self.cv.save();
+        self.cv.reset_transform();
+        self.cv.reset_scissor();
+        self.cv.global_composite_operation(CompositeOperation::Copy);
+        let paint = Paint::image(img, 0.0, 0.0, w as f32, h as f32, 0.0, 1.0).with_anti_alias(false);
+        self.cv.fill_path(&Self::rect_path(r.x0 as f32, r.y0 as f32, (r.x1 - r.x0) as f32, (r.y1 - r.y0) as f32), &paint);
+        self.cv.restore();
+    }
+
+    fn set_clip(&mut self, r: Option<&IRect>) {
+        self.clip = r.copied();
+    }
+
+    // The scissor clips every operation exactly: nothing to save / put back.
+    fn save_rect(&mut self, _r: &IRect, _buf: &mut Vec<u8>) {}
+    fn restore_outside(&mut self, _r: &IRect, _buf: &[u8], _keep: &IRect) {}
+}
+
+/// Fewer, looser rectangles than the CPU path (femtovg pays per draw call), but
+/// not huge ones (replaying every op touching them costs more than it saves).
+/// `LLMV_GL_MERGE=ratio,max` overrides (experiments).
+fn gpu_merge_tuning() -> (u32, usize) {
+    static T: std::sync::OnceLock<(u32, usize)> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("LLMV_GL_MERGE")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            })
+            .unwrap_or((150, 12))
+    })
 }

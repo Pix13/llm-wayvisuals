@@ -98,6 +98,12 @@ fn fail(code: i32, msg: impl AsRef<str>) -> ! {
 }
 
 fn run(a: RunArgs) {
+    // Mesa's GL thread only adds CPU on top of our single render thread
+    // (measured: -1.5 points of process CPU). Must be set before any GL use.
+    #[cfg(feature = "gpu")]
+    if std::env::var_os("mesa_glthread").is_none() {
+        std::env::set_var("mesa_glthread", "false");
+    }
     let backend = WinitBackend;
     if a.list_outputs {
         if let Err(e) = backend.list_outputs() {

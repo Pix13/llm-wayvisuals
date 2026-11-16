@@ -185,6 +185,19 @@ impl Renderer {
         d
     }
 
+    /// Incremental render on any [`incr::RectCanvas`] whose main target keeps
+    /// its content between calls (the GPU backend's band image). Same
+    /// contract as [`Renderer::render_incremental`]: an empty, non-full
+    /// [`Damage`] means nothing changed. Non-live signals repaint everything.
+    pub fn render_incremental_on(&mut self, cv: &mut dyn incr::RectCanvas, w: u32, h: u32, view: &PanelView) -> Damage {
+        if view.signal != Signal::Live {
+            self.incr = None;
+            self.render_canvas(cv, w, h, view);
+            return Damage::full(w, h);
+        }
+        self.render_live_incremental(cv, w, h, view)
+    }
+
     fn render_live_incremental(&mut self, cv: &mut dyn incr::RectCanvas, w: u32, h: u32, view: &PanelView) -> Damage {
         let _p = profile::scope(Cat::Render);
         if self.owner != Some(cv.instance_id()) {
@@ -220,7 +233,10 @@ impl Renderer {
                 .take()
                 .filter(|(n, f)| *n == th.name && f.size() == (w, h))
                 .and_then(|(_, prev)| incr::diff(&prev, &frame))
-                .map(|r| incr::close_rects(r, &frame))
+                .map(|r| {
+                    let (ratio, max) = cv.merge_tuning();
+                    incr::close_rects_tuned(r, &frame, ratio, max)
+                })
         };
         let _p = profile::scope(Cat::Replay);
         let (damage, nops) = match rects {

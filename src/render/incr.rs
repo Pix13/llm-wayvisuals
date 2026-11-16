@@ -75,6 +75,15 @@ impl IRect {
 /// A canvas that can restore a rectangle of the target from a layer (the
 /// CPU backend; needed by the incremental renderer only).
 pub trait RectCanvas: Canvas {
+    /// How the dirty rectangles are merged for this backend: `(ratio_pct,
+    /// max_rects)`. Two rectangles merge when their bounding box is at most
+    /// `ratio_pct` % of their summed area; then the closest pairs are merged
+    /// until at most `max_rects` remain. The CPU pays per pixel (tight
+    /// rectangles), a GPU per draw call (few rectangles).
+    fn merge_tuning(&self) -> (u32, usize) {
+        (125, usize::MAX)
+    }
+
     /// Copies the pixels of `r` from layer `id` (same size as the target)
     /// into the target.
     fn layer_copy_rect(&mut self, id: LayerId, r: &IRect);
@@ -389,7 +398,13 @@ pub fn diff(prev: &Frame, cur: &Frame) -> Option<Vec<IRect>> {
 /// [`replay_in`]): every pixel of every rectangle is rebuilt from the static
 /// layer and all ops touching it, in order, so repainting a pixel twice gives
 /// the same value.
-pub fn close_rects(mut rects: Vec<IRect>, _frame: &Frame) -> Vec<IRect> {
+pub fn close_rects(rects: Vec<IRect>, frame: &Frame) -> Vec<IRect> {
+    close_rects_tuned(rects, frame, 125, usize::MAX)
+}
+
+/// [`close_rects`] with an explicit merge ratio (percent) and a cap on the
+/// number of rectangles (see [`RectCanvas::merge_tuning`]).
+pub fn close_rects_tuned(mut rects: Vec<IRect>, _frame: &Frame, ratio_pct: u32, max_rects: usize) -> Vec<IRect> {
     rects.sort_by_key(|r| (r.y0, r.x0));
     let mut out: Vec<IRect> = Vec::with_capacity(rects.len());
     for mut cur in rects {
@@ -397,7 +412,7 @@ pub fn close_rects(mut rects: Vec<IRect>, _frame: &Frame) -> Vec<IRect> {
             let from = out.len().saturating_sub(24);
             let hit = (from..out.len()).rev().find(|&i| {
                 let u = out[i].union(&cur);
-                u.area() * 100 <= (out[i].area() + cur.area()) * 125
+                u.area() * 100 <= (out[i].area() + cur.area()) * ratio_pct as i64
             });
             match hit {
                 Some(i) => cur = cur.union(&out.swap_remove(i)),
@@ -405,6 +420,20 @@ pub fn close_rects(mut rects: Vec<IRect>, _frame: &Frame) -> Vec<IRect> {
             }
         }
         out.push(cur);
+    }
+    // cap: merge the pair whose union adds the least area until few enough remain
+    while out.len() > max_rects.max(1) {
+        let mut best = (i64::MAX, 0, 1);
+        for i in 0..out.len() {
+            for j in i + 1..out.len() {
+                let grow = out[i].union(&out[j]).area() - out[i].area() - out[j].area();
+                if grow < best.0 {
+                    best = (grow, i, j);
+                }
+            }
+        }
+        let b = out.swap_remove(best.2);
+        out[best.1] = out[best.1].union(&b);
     }
     out
 }

@@ -143,6 +143,9 @@ struct SurfaceWin {
     monitor: Option<MonitorHandle>,
     /// Last logged inner size (to log geometry once per change).
     last_size: Option<(u32, u32)>,
+    /// GPU surfaces: time of the last swap.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    last_present: Option<Instant>,
     index: usize,
     /// Damage (surface pixels) of the last presented frames, oldest first;
     /// `None` = the whole surface. Used to refresh buffers that are older than one frame.
@@ -268,7 +271,7 @@ impl App {
             };
             self.by_id.insert(window.id(), self.surfaces.len());
             window.request_redraw();
-            self.surfaces.push(SurfaceWin { gpu, slots, window, surface, monitor, last_size: None, index: n + 1, hist: VecDeque::new() });
+            self.surfaces.push(SurfaceWin { gpu, slots, window, surface, monitor, last_size: None, last_present: None, index: n + 1, hist: VecDeque::new() });
         }
         self.ctx = Some(ctx);
         Ok(())
@@ -323,15 +326,22 @@ impl App {
                 g.resize_surface(size.width, size.height);
             }
             let mut placed = Vec::with_capacity(geo.len());
+            let mut changed = resized;
             for (bi, (slot, b)) in sw.slots.iter_mut().zip(&geo).enumerate() {
                 if b.w == 0 || b.h == 0 {
                     continue;
                 }
-                slot.core.render_gpu(g, bi, b.w, b.h, t);
+                let d = slot.core.render_gpu(g, bi, b.w, b.h, t);
+                changed |= d.full || !d.is_empty();
                 placed.push((bi, b.x as i32, b.y as i32));
             }
-            if let Err(e) = g.present_bands(&placed, size.width, size.height) {
-                log(format!("present failed: {e}"));
+            // Nothing changed on any band: no commands, no swap (the window keeps
+            // its last frame). A refresh at least once per second covers exposure.
+            if changed || sw.last_present.is_none_or(|p| p.elapsed() >= Duration::from_secs(1)) {
+                if let Err(e) = g.present_bands(&placed, size.width, size.height) {
+                    log(format!("present failed: {e}"));
+                }
+                sw.last_present = Some(Instant::now());
             }
             drop(_frame);
             profile::frame_done();

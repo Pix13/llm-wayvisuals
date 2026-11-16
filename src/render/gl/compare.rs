@@ -190,4 +190,59 @@ mod tests {
             assert!(d.psnr >= 35.0 && d.pct_gt16 <= 1.0, "{d:?}");
         }
     }
+
+    /// The incremental GPU render (persistent band image, scissored replay) must
+    /// equal a full GPU redraw of the same frame, and stay close to the CPU
+    /// reference, over a sequence of changing data, times, sizes, themes and
+    /// signals. Skipped where there is no hardware GL.
+    #[test]
+    fn gpu_incremental_equals_gpu_full_over_a_sequence() {
+        let Ok(mut gpu) = GpuRenderer::new_headless() else {
+            eprintln!("skipped: no hardware GL context");
+            return;
+        };
+        let names = ["synthetic-v2-A", "synthetic-v2-C", "live-maya-decode", "synthetic-v2-B", "live-maya-idle", "synthetic-v2-D"];
+        let snaps: Vec<Snapshot> =
+            names.iter().map(|n| Snapshot::parse(&std::fs::read_to_string(format!("fixtures/{n}.json")).unwrap()).unwrap()).collect();
+        let themes = [crate::theme::theme("green").unwrap(), crate::theme::theme("blue").unwrap()];
+        let sel = ModelSelect::Auto;
+        let (mut inc, mut full, mut cpu_r) = (Renderer::new(), Renderer::new(), Renderer::new());
+        let (mut partial, mut live, mut worst_psnr, mut worst_vs_full) = (0, 0, f64::INFINITY, f64::INFINITY);
+        let mut t = 0.0f32;
+        for step in 0..120usize {
+            t += 1.0 / 30.0;
+            let (w, h) = if step < 80 { (1920, 348) } else { (1920, 480) };
+            let snap = &snaps[(step / 9) % snaps.len()];
+            let th = &themes[usize::from((60..75).contains(&step))];
+            let n = 120 + (step % 5);
+            let wave: Vec<(f32, Option<f32>)> =
+                (0..n).map(|i| (1.0 - i as f32 / (n - 1) as f32, if i % 37 == 5 { None } else { Some(40.0 + ((i + step) * 7 % 23) as f32) })).collect();
+            let cpu: Vec<(f32, Option<f32>)> =
+                (0..15).map(|i| (1.0 - (i as f32 + t.fract()) / 15.0, Some(20.0 + ((i + step / 2) % 9) as f32 * 5.0))).collect();
+            let signal = if (30..34).contains(&step) { Signal::Stale { age_s: 3.0 } } else { Signal::Live };
+            let view = PanelView {
+                snapshot: Some(snap), model: &sel, signal: signal.clone(), theme: th, title: None,
+                wave: &wave, wave_max: Some(90.0), cpu_wave: &cpu, t,
+            };
+            let d = gpu.render_band_incremental(0, &mut inc, w, h, &view);
+            gpu.render_band(1, &mut full, w, h, &view);
+            gpu.submit();
+            let a = gpu.read_band_rgba(0).unwrap().2;
+            let b = gpu.read_band_rgba(1).unwrap().2;
+            let mut c = Pixmap::new(w, h).unwrap();
+            cpu_r.render(&mut c, &view);
+            let vs_full = diff(&b, &a);
+            let vs_cpu = diff(c.data(), &a);
+            worst_vs_full = worst_vs_full.min(vs_full.psnr);
+            worst_psnr = worst_psnr.min(vs_cpu.psnr);
+            assert!(vs_full.psnr >= 45.0, "step {step}: incremental vs full GPU {vs_full:?}");
+            assert!(vs_cpu.psnr >= 35.0 && vs_cpu.pct_gt16 <= 1.0, "step {step}: incremental vs CPU {vs_cpu:?}");
+            if signal == Signal::Live {
+                live += 1;
+                partial += usize::from(!d.full);
+            }
+        }
+        eprintln!("worst PSNR: incremental vs full GPU {worst_vs_full:.1} dB, vs CPU {worst_psnr:.1} dB; {partial}/{live} live frames partial");
+        assert!(partial * 10 >= live * 7, "only {partial} of {live} live frames were partial");
+    }
 }

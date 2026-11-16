@@ -492,11 +492,11 @@ impl PanelCore {
         self.with_view(t, |r, view| r.render_incremental(pm, view))
     }
 
-    /// GPU path: records the whole `w` x `h` band into image `band` of `gpu`
-    /// (no damage tracking).
+    /// GPU path: repaints what changed of the `w` x `h` band into its persistent
+    /// image `band` of `gpu`; returns what changed (empty = nothing).
     #[cfg(feature = "gpu")]
-    pub fn render_gpu(&mut self, gpu: &mut llm_wayvisuals::render::gl::GpuRenderer, band: usize, w: u32, h: u32, t: f32) {
-        self.with_view(t, |r, view| gpu.render_band(band, r, w, h, view))
+    pub fn render_gpu(&mut self, gpu: &mut llm_wayvisuals::render::gl::GpuRenderer, band: usize, w: u32, h: u32, t: f32) -> Damage {
+        self.with_view(t, |r, view| gpu.render_band_incremental(band, r, w, h, view))
     }
 }
 
