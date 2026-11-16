@@ -1,6 +1,6 @@
 [package]
 name = "llm-wayvisuals"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Sci-fi 1920x480 sensor panels for llm-visuals stats (Linux, Wayland and X11)"
 license = "MIT"
