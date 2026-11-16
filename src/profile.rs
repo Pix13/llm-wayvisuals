@@ -37,6 +37,12 @@ pub enum Cat {
     Rain,
     /// Title bar, NO SIGNAL overlay and frozen-image copy.
     Overlay,
+    /// Recording of the live frame's draw operations (incremental render).
+    Record,
+    /// Frame diff and dirty-rectangle closure.
+    Diff,
+    /// Restore + repaint of the dirty rectangles.
+    Replay,
     /// RGBA -> 0RGB conversion into the softbuffer buffer.
     Convert,
     /// `surface.buffer_mut()` (acquire / wait for a free buffer).
@@ -45,7 +51,7 @@ pub enum Cat {
     Present,
 }
 
-const CATS: [(Cat, &str); 14] = [
+const CATS: [(Cat, &str); 17] = [
     (Cat::Tick, "tick/feed"),
     (Cat::Frame, "frame (redraw)"),
     (Cat::Render, "render"),
@@ -57,6 +63,9 @@ const CATS: [(Cat, &str); 14] = [
     (Cat::Centre, "  centre"),
     (Cat::Rain, "    rain"),
     (Cat::Overlay, "  overlay/title"),
+    (Cat::Record, "  record ops"),
+    (Cat::Diff, "  diff"),
+    (Cat::Replay, "  restore+replay"),
     (Cat::Convert, "convert"),
     (Cat::Acquire, "acquire buf"),
     (Cat::Present, "present"),
@@ -93,6 +102,8 @@ struct Stats {
     tiles: HashMap<(usize, usize), Vec<u64>>,
     /// (surface, band) -> changed-tile percentages this period
     changed: HashMap<(usize, usize), Vec<f64>>,
+    /// Incremental renders: (repainted area fraction, rects, ops replayed, ops recorded).
+    damage: Vec<(f64, usize, usize, usize)>,
 }
 
 thread_local! {
@@ -109,6 +120,7 @@ fn with<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
             cpu_ticks: cpu_ticks(),
             tiles: HashMap::new(),
             changed: HashMap::new(),
+            damage: Vec::new(),
         });
         f(st)
     })
@@ -174,6 +186,15 @@ pub fn tiles(surface: usize, band: usize, data: &[u8], w: usize, h: usize) {
     });
 }
 
+/// Records one incremental band render: repainted area fraction (0..1),
+/// number of rectangles, ops replayed and ops recorded.
+pub fn damage(area_frac: f64, rects: usize, replayed: usize, recorded: usize) {
+    if !enabled() {
+        return;
+    }
+    with(|s| s.damage.push((area_frac, rects, replayed, recorded)));
+}
+
 /// Counts one finished frame and prints the report every 5 s.
 pub fn frame_done() {
     if !enabled() {
@@ -228,6 +249,15 @@ pub fn frame_done() {
             eprintln!("[profile]   tiles surface {} band {}: {:.1} % changed (mean), max {:.1} %", k.0, k.1, mean, max);
         }
         s.changed.clear();
+        if !s.damage.is_empty() {
+            let n = s.damage.len() as f64;
+            let area = s.damage.iter().map(|d| d.0).sum::<f64>() / n * 100.0;
+            let max = s.damage.iter().map(|d| d.0).fold(0.0, f64::max) * 100.0;
+            let rects = s.damage.iter().map(|d| d.1 as f64).sum::<f64>() / n;
+            let (rep, rec) = (s.damage.iter().map(|d| d.2 as f64).sum::<f64>() / n, s.damage.iter().map(|d| d.3 as f64).sum::<f64>() / n);
+            eprintln!("[profile]   repainted: {area:.1} % of the band area (max {max:.1} %), {rects:.1} rects, {rep:.0} of {rec:.0} ops replayed per band frame");
+            s.damage.clear();
+        }
         s.frames = 0;
         s.since = Instant::now();
         s.cpu_ticks = ticks;

@@ -294,6 +294,7 @@ fn gauge_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, g: Gauge, frac: Opt
             fill(pm, &p, c);
         }
     }
+    pm.group();
     if live {
         let head = (t * 3.0) as usize % RING_N;
         for (j, a) in [1.0f32, 0.55, 0.28].iter().enumerate() {
@@ -304,6 +305,7 @@ fn gauge_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, g: Gauge, frac: Opt
             line(pm, x0, y0, x1, y1, alpha(th.bright, 0.8 * a), 7.0 * k);
         }
     }
+    pm.group();
     text(pm, &f.label, px(13.0, k, 10.0), cx, cy + 26.0 * k, sub, th.dim, 0.5, Align::Center);
 }
 
@@ -427,6 +429,7 @@ pub fn draw_top_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, d
     let u = lay.ut;
     // ---- right: GPU card = aggregate over the model's GPUs
     // (mean util / clock, total power / VRAM, max temperatures).
+    pm.group();
     let r = lay.top(2);
     let gr = gauge_of(r, true, u);
     let gs = &d.gpus;
@@ -529,6 +532,7 @@ pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay
     // (PROMPT / CACHED) is dropped.
     let second = u >= 0.8;
     // MEMORY: summed over the model's GPUs
+    pm.group();
     let b = lay.bot(0);
     let used = sum_opt(d.gpus.iter().map(|g| g.mem_used_mb.map(|v| v as f64)));
     let total = sum_opt(d.gpus.iter().map(|g| g.mem_total_mb.map(|v| v as f64)));
@@ -549,6 +553,7 @@ pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay
     }
 
     // CONTEXT
+    pm.group();
     let b = lay.bot(1);
     let fillc = m.and_then(|m| m.ctx_fill());
     big_bar_card(pm, th, f, b, "CTX FILL", fillc.map(|v| v * 100.0), fillc.map(|v| v as f32), u);
@@ -566,6 +571,7 @@ pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay
     }
 
     // TEMPERATURE: GPU temps, then memory temps (rows that do not fit are dropped)
+    pm.group();
     let b = lay.bot(3);
     let (y0, pitch) = rows(b, u);
     let mut trows: Vec<(String, Option<f64>, f64)> = Vec::new();
@@ -590,6 +596,7 @@ pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay
     }
 
     // POWER: per GPU (max 3), then TOTAL, then LIMIT
+    pm.group();
     let b = lay.bot(4);
     let (y0, pitch) = rows(b, u);
     let tp = sum_opt(d.gpus.iter().map(|g| g.power_w));
@@ -624,6 +631,7 @@ pub fn draw_bottom_dynamic(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay
     }
 
     // REQUESTS
+    pm.group();
     let b = lay.bot(5);
     let (y0, pitch) = rows(b, u);
     let lr = m.and_then(|m| m.last_request.as_ref());

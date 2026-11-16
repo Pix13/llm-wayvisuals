@@ -256,4 +256,12 @@ pub trait Canvas {
     /// Source-over composite of the layer on the target at `(x, y)`.
     fn layer_blit(&mut self, id: LayerId, x: i32, y: i32);
     fn layer_filter(&mut self, id: LayerId, f: LayerFilter);
+
+    // -- hints --
+
+    /// Marks the start of a new group of operations. The scene code emits it
+    /// between independent parts (a pipe, a box, a fan) so that the CPU
+    /// incremental renderer can tell what changed between two frames.
+    /// Backends that redraw everything ignore it.
+    fn group(&mut self) {}
 }

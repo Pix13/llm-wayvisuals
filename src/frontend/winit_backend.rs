@@ -1,7 +1,7 @@
 //! winit + softbuffer backend (Wayland and X11, CPU only).
 
 use super::{
-    assign_outputs, bands, blit_xrgb, default_window_size, group_panels, log, Backend, Pacer, PanelCore,
+    assign_outputs, bands, blit_xrgb, blit_xrgb_rect, coalesce, default_window_size, group_panels, log, Backend, Pacer, PanelCore,
     RunOptions, Target,
 };
 use llm_wayvisuals::config::MAX_PANELS;
@@ -9,7 +9,7 @@ use llm_wayvisuals::profile::{self, Cat};
 use llm_wayvisuals::render;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use softbuffer::{Context, Surface};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -134,6 +134,9 @@ struct SurfaceWin {
     /// Last logged inner size (to log geometry once per change).
     last_size: Option<(u32, u32)>,
     index: usize,
+    /// Damage (surface pixels) of the last presented frames, oldest first;
+    /// `None` = the whole surface. Used to refresh buffers that are older than one frame.
+    hist: VecDeque<Option<Vec<render::Rect>>>,
 }
 
 struct App {
@@ -219,7 +222,7 @@ impl App {
             let surface = Surface::new(&ctx, window.clone()).map_err(|e| format!("softbuffer: {e}"))?;
             self.by_id.insert(window.id(), self.surfaces.len());
             window.request_redraw();
-            self.surfaces.push(SurfaceWin { slots, window, surface, monitor, last_size: None, index: n + 1 });
+            self.surfaces.push(SurfaceWin { slots, window, surface, monitor, last_size: None, index: n + 1, hist: VecDeque::new() });
         }
         self.ctx = Some(ctx);
         Ok(())
@@ -237,7 +240,10 @@ impl App {
             return;
         }
         let geo = bands(size.width, size.height, sw.slots.len());
+        let mut resized = false;
         if sw.last_size != Some((size.width, size.height)) {
+            resized = true;
+            sw.hist.clear();
             sw.last_size = Some((size.width, size.height));
             let desc: Vec<String> = geo
                 .iter()
@@ -262,6 +268,32 @@ impl App {
                 desc.join(", ")
             ));
         }
+        // 1. render every band into its persistent pixmap, collect the damage
+        let mut full = resized;
+        let mut cur: Vec<render::Rect> = Vec::new();
+        for (bi, (slot, b)) in sw.slots.iter_mut().zip(&geo).enumerate() {
+            if b.w == 0 || b.h == 0 {
+                continue;
+            }
+            if slot.pm.as_ref().is_none_or(|pm| pm.width() != b.w || pm.height() != b.h) {
+                slot.pm = Pixmap::new(b.w, b.h);
+            }
+            let Some(pm) = slot.pm.as_mut() else { continue };
+            let d = slot.core.render(pm, t);
+            if d.full {
+                full = true;
+            }
+            cur.extend(d.rects.iter().map(|r| render::Rect { x: r.x + b.x, y: r.y + b.y, ..*r }));
+            profile::tiles(idx, bi, pm.data(), b.w as usize, b.h as usize);
+        }
+        let cur = if full { cur } else { coalesce(cur) };
+        if !full && cur.is_empty() {
+            // nothing changed: the displayed frame is still right
+            drop(_frame);
+            profile::frame_done();
+            return;
+        }
+        // 2. get a buffer and bring it up to date
         let acquire = profile::scope(Cat::Acquire);
         let mut buf = match sw.surface.buffer_mut() {
             Ok(b) => b,
@@ -271,33 +303,78 @@ impl App {
             }
         };
         drop(acquire);
-        let stride = size.width as usize;
-        if geo.len() == 1 {
-            // Letterbox rows outside the single band.
-            let b = geo[0];
-            let (top, bottom) = ((b.y as usize) * stride, ((b.y + b.h) as usize) * stride);
-            buf[..top].fill(0);
-            buf[bottom..].fill(0);
+        let age = buf.age() as usize;
+        // The buffer holds the frame presented `age` frames ago: refresh the
+        // damage of the frames since, plus the current one.
+        let mut copy: Option<Vec<render::Rect>> = None;
+        if !full && age >= 1 && age - 1 <= sw.hist.len() {
+            let mut v = cur.clone();
+            let mut ok = true;
+            for h in sw.hist.iter().rev().take(age - 1) {
+                match h {
+                    Some(r) => v.extend(r.iter().copied()),
+                    None => ok = false,
+                }
+            }
+            if ok {
+                copy = Some(v);
+            }
         }
-        for (bi, (slot, b)) in sw.slots.iter_mut().zip(&geo).enumerate() {
-            if b.w == 0 || b.h == 0 {
-                continue;
+        let stride = size.width as usize;
+        {
+            let _p = profile::scope(Cat::Convert);
+            match &copy {
+                None => {
+                    if geo.len() == 1 {
+                        // Letterbox rows outside the single band.
+                        let b = geo[0];
+                        let (top, bottom) = ((b.y as usize) * stride, ((b.y + b.h) as usize) * stride);
+                        buf[..top].fill(0);
+                        buf[bottom..].fill(0);
+                    }
+                    for (slot, b) in sw.slots.iter().zip(&geo) {
+                        if let (Some(pm), true) = (slot.pm.as_ref(), b.w > 0 && b.h > 0) {
+                            blit_xrgb(pm.data(), b.w as usize, &mut buf, stride, b.x as usize, b.y as usize);
+                        }
+                    }
+                }
+                Some(rects) => {
+                    for (slot, b) in sw.slots.iter().zip(&geo) {
+                        let Some(pm) = slot.pm.as_ref().filter(|_| b.w > 0 && b.h > 0) else { continue };
+                        for r in rects {
+                            // surface rect -> band-local rect
+                            let (x0, y0) = (r.x.max(b.x), r.y.max(b.y));
+                            let (x1, y1) = ((r.x + r.w).min(b.x + b.w), (r.y + r.h).min(b.y + b.h));
+                            if x1 > x0 && y1 > y0 {
+                                let local = render::Rect { x: x0 - b.x, y: y0 - b.y, w: x1 - x0, h: y1 - y0 };
+                                blit_xrgb_rect(pm.data(), b.w as usize, &mut buf, stride, b.x as usize, b.y as usize, &local);
+                            }
+                        }
+                    }
+                }
             }
-            if slot.pm.as_ref().is_none_or(|pm| pm.width() != b.w || pm.height() != b.h) {
-                slot.pm = Pixmap::new(b.w, b.h);
-            }
-            let Some(pm) = slot.pm.as_mut() else { continue };
-            slot.core.render(pm, t);
-            {
-                let _p = profile::scope(Cat::Convert);
-                blit_xrgb(pm.data(), b.w as usize, &mut buf, stride, b.x as usize, b.y as usize);
-            }
-            profile::tiles(idx, bi, pm.data(), b.w as usize, b.h as usize);
         }
         {
             let _p = profile::scope(Cat::Present);
-            if let Err(e) = buf.present() {
+            let res = if full {
+                buf.present()
+            } else {
+                let dmg: Vec<softbuffer::Rect> = cur
+                    .iter()
+                    .filter_map(|r| {
+                        Some(softbuffer::Rect { x: r.x, y: r.y, width: NonZeroU32::new(r.w)?, height: NonZeroU32::new(r.h)? })
+                    })
+                    .collect();
+                buf.present_with_damage(&dmg)
+            };
+            if let Err(e) = res {
                 log(format!("present failed: {e}"));
+                sw.hist.clear();
+            } else {
+                sw.hist.push_back(if full { None } else { Some(cur) });
+                while sw.hist.len() > 8 {
+                    sw.hist.pop_front();
+                }
             }
         }
         drop(_frame);

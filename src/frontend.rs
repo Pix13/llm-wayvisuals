@@ -12,7 +12,7 @@ use llm_wayvisuals::config::PanelConfig;
 use llm_wayvisuals::history::History;
 use llm_wayvisuals::model::{Bottleneck, ModelSelect, Phase, Snapshot};
 use std::sync::Arc;
-use llm_wayvisuals::render::{PanelView, Renderer, Signal};
+use llm_wayvisuals::render::{Damage, PanelView, Rect, Renderer, Signal};
 use llm_wayvisuals::source::{Feed, LinkStatus, Source};
 use llm_wayvisuals::theme::{self, Theme};
 use std::time::{Duration, Instant};
@@ -466,7 +466,8 @@ impl PanelCore {
         }
     }
 
-    pub fn render(&mut self, pm: &mut Pixmap, t: f32) {
+    /// Renders into the panel's persistent band pixmap; returns what changed.
+    pub fn render(&mut self, pm: &mut Pixmap, t: f32) -> Damage {
         let now = Instant::now();
         let wave = self.history.samples(now);
         let cpu_wave = self.cpu.samples(now);
@@ -481,7 +482,7 @@ impl PanelCore {
             cpu_wave: &cpu_wave,
             t,
         };
-        self.renderer.render(pm, &view);
+        self.renderer.render_incremental(pm, &view)
     }
 }
 
@@ -503,9 +504,79 @@ pub fn blit_xrgb(src: &[u8], band_w: usize, dst: &mut [u32], stride: usize, x: u
     }
 }
 
+/// Coalesces damage rectangles: two rectangles are replaced by their bounding
+/// box when that box is at most 1.25 times as large as both together (so
+/// overlapping and neighbouring rectangles merge, far-apart ones do not).
+/// The result covers every input rectangle.
+pub fn coalesce(mut rects: Vec<Rect>) -> Vec<Rect> {
+    let area = |r: &Rect| r.w as u64 * r.h as u64;
+    let bound = |a: &Rect, b: &Rect| {
+        let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+        let (x1, y1) = ((a.x + a.w).max(b.x + b.w), (a.y + a.h).max(b.y + b.h));
+        Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i < rects.len() {
+            let mut j = i + 1;
+            while j < rects.len() {
+                let u = bound(&rects[i], &rects[j]);
+                if area(&u) * 100 <= (area(&rects[i]) + area(&rects[j])) * 125 {
+                    rects[i] = u;
+                    rects.swap_remove(j);
+                    changed = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+    rects
+}
+
+/// Converts only the band-local rectangle `r` of a `band_w`-wide RGBA band
+/// into `dst` (row stride `stride`), the band sitting at (`x`, `y`).
+pub fn blit_xrgb_rect(src: &[u8], band_w: usize, dst: &mut [u32], stride: usize, x: usize, y: usize, r: &Rect) {
+    let (rx, rw) = (r.x as usize, r.w as usize);
+    for row in r.y as usize..(r.y + r.h) as usize {
+        let s = (row * band_w + rx) * 4;
+        let d = (y + row) * stride + x + rx;
+        let (Some(srow), Some(drow)) = (src.get(s..s + rw * 4), dst.get_mut(d..d + rw)) else { break };
+        rgba_to_xrgb(srow, drow);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coalesce_covers_inputs() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        let input = vec![r(0, 0, 10, 10), r(8, 0, 10, 10), r(500, 300, 5, 5), r(9, 9, 3, 3)];
+        let out = coalesce(input.clone());
+        assert_eq!(out.len(), 2);
+        for a in &input {
+            assert!(out.iter().any(|b| a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h));
+        }
+    }
+
+    #[test]
+    fn rect_conversion() {
+        // 3x2 band at (1,1) in a 5x4 surface; convert only its (1,1) 2x1 corner
+        let mut src = Vec::new();
+        for i in 0..6u8 {
+            src.extend_from_slice(&[i, 0, 0, 255]);
+        }
+        let mut d = vec![0u32; 5 * 4];
+        blit_xrgb_rect(&src, 3, &mut d, 5, 1, 1, &Rect { x: 1, y: 1, w: 2, h: 1 });
+        assert_eq!(d[2 * 5 + 2], 4 << 16);
+        assert_eq!(d[2 * 5 + 3], 5 << 16);
+        assert_eq!(d.iter().filter(|v| **v != 0).count(), 2);
+    }
 
     fn outs() -> Vec<(String, usize)> {
         ["HDMI-1", "eDP-1", "DP-2", "DP-3"]

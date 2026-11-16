@@ -172,6 +172,7 @@ fn along(p: &[(f32, f32)], mut d: f32) -> (f32, f32, f32, f32) {
 
 /// A pipe (hollow tube) along `pts` in flow direction, with an arrow head.
 fn pipe(pm: &mut dyn Canvas, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, t: f32) {
+    pm.group();
     let pts = dedupe(pts);
     if pts.len() < 2 {
         return;
@@ -198,6 +199,7 @@ fn pipe(pm: &mut dyn Canvas, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, 
         stroke(pm, &path, alpha(col, inner), pw - 2.4);
     }
     // particles
+    pm.group();
     if let Link::Flow(f) | Link::Limit(f) = st {
         let l = path_len(&pts);
         let spacing = 28.0 - 17.0 * f;
@@ -216,6 +218,7 @@ fn pipe(pm: &mut dyn Canvas, th: &Theme, pts: &[(f32, f32)], pw: f32, st: Link, 
         }
     }
     // arrow head at the end
+    pm.group();
     let n = pts.len();
     let (x1, y1) = pts[n - 1];
     let (x0, y0) = pts[n - 2];
@@ -262,6 +265,7 @@ fn rate_text(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, align: 
 
 #[allow(clippy::too_many_arguments)]
 fn gpu_box(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h: f32, i: u32, g: Option<&GpuNode>, bound: bool, t: f32, u: f32) {
+    pm.group();
     let busy = g.and_then(|g| g.busy_pct);
     let border = if bound { red() } else { alpha(th.accent, 0.65) };
     let body = rrect_path(x, y, w, h, 5.0 * u.max(0.7));
@@ -297,7 +301,9 @@ fn gpu_box(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, x: f32, y: f32, w: f32, h
     }
     // fan, spinning with the memory/compute activity
     let (fcx, fcy) = (x + w - fr - 8.0, y + h * 0.40);
+    pm.group();
     fan_rot(pm, fcx, fcy, fr, alpha(if bound { red() } else { th.bright }, 0.85), t * (40.0 + 600.0 * busy.unwrap_or(0.0) as f32 / 100.0));
+    pm.group();
     // VRAM bar
     let bw = (w - fr * 2.0 - 26.0).max(30.0);
     let bh = (7.0 * u).max(5.0);
@@ -414,6 +420,7 @@ pub fn draw_data_path(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: 
         text(pm, &f.semi, px(14.0, u, 11.0), card.x + card.w - 16.0, gy - 2.0 * u, &format!("+{}", v.extra), th.dim, 0.5, Align::Right);
     }
     // CPU chip
+    pm.group();
     {
         let body = rrect_path(cpu.x, cpu.y, cpu.w, cpu.h, 4.0);
         fill(pm, &body, Color::BLACK);
@@ -454,6 +461,7 @@ pub fn draw_data_path(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: 
     }
 
     // ---- verdict (left column, free area)
+    pm.group();
     let lx = card.x + 24.0;
     let any_flow = v.ram_gb_s.is_some_and(|r| r > 0.05)
         || v.disk_mb_s.is_some_and(|d| d > 1.0)
@@ -521,11 +529,13 @@ impl<'a> CpuView<'a> {
 }
 
 pub fn draw_cpu_card(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: &CpuView) {
+    pm.group();
     let b = lay.bot(2);
     let u = lay.ub;
     text(pm, &f.label, px(14.0, u, 10.0), b.x + 14.0, b.y + 70.0 * u, "SYSTEM LOAD", th.text, 1.0, Align::Left);
     text(pm, &f.semi, px(34.0, u, 22.0), b.x + b.w - 14.0, b.y + 74.0 * u, &fmt::pct(v.cpu_pct), th.value, 0.2, Align::Right);
     // area chart, 0..100 %
+    pm.group();
     let (x0, x1) = (b.x + 14.0, b.x + b.w - 14.0);
     let (cy0, cy1) = (b.y + 82.0 * u, b.y + 128.0 * u);
     for (k, a) in [(0.0, 0.22), (0.5, 0.10), (1.0, 0.10)] {
@@ -582,6 +592,7 @@ pub fn draw_cpu_card(pm: &mut dyn Canvas, th: &Theme, f: &Fonts, lay: &Lay, v: &
     if let Some((ex, ey)) = last {
         fill(pm, &circle_path(ex, ey, 2.6), th.value);
     }
+    pm.group();
     let pc = v.proc_pct.map_or(fmt::NONE.to_string(), |p| format!("{p:.1}%"));
     let th_s = v.threads.map_or(format!("{}T", fmt::NONE), |t| format!("{t}T"));
     let proc = format!("PROC {pc} · {th_s}");

@@ -7,6 +7,7 @@ pub mod canvas;
 mod draw;
 mod fmt;
 mod fx;
+pub mod incr;
 mod scene;
 pub mod skia;
 pub mod text;
@@ -77,6 +78,41 @@ pub struct Renderer {
     frozen_size: (u32, u32),
     gen_mask: Option<(String, Mask)>,
     pre_mask: Option<(String, Mask)>,
+    /// Recorded dynamic content of the previous live frame ([`Renderer::render_incremental`]).
+    incr: Option<(&'static str, incr::Frame)>,
+}
+
+/// A rectangle of the target pixmap, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// What [`Renderer::render_incremental`] changed in the pixmap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Damage {
+    /// The whole pixmap was repainted (`rects` is then the full area).
+    pub full: bool,
+    /// Disjoint repainted rectangles.
+    pub rects: Vec<Rect>,
+}
+
+impl Damage {
+    pub fn full(w: u32, h: u32) -> Damage {
+        Damage { full: true, rects: vec![Rect { x: 0, y: 0, w, h }] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    /// Repainted pixels.
+    pub fn area(&self) -> u64 {
+        self.rects.iter().map(|r| r.w as u64 * r.h as u64).sum()
+    }
 }
 
 impl Default for Renderer {
@@ -106,7 +142,7 @@ impl Renderer {
         let fonts = Fonts::load();
         let rain = Rain::new(&fonts.label);
         let dm = fx::digit_metrics(&fonts.digits);
-        Renderer { fonts, rain, dm, skia: SkiaStore::new(), owner: None, stat: None, dynlayer: None, frozen: None, frozen_size: (0, 0), gen_mask: None, pre_mask: None }
+        Renderer { fonts, rain, dm, skia: SkiaStore::new(), owner: None, stat: None, dynlayer: None, frozen: None, frozen_size: (0, 0), gen_mask: None, pre_mask: None, incr: None }
     }
 
     /// Renders into `pm`, filling it, natively at any size. All geometry
@@ -126,6 +162,87 @@ impl Renderer {
         self.skia = store;
     }
 
+    /// Like [`Renderer::render`], but repaints only what changed since the
+    /// previous call: `pm` must be the very pixmap of the previous call
+    /// (same size, content untouched in between). Returns the repainted
+    /// area; the result is pixel-identical to a full `render`. Non-live
+    /// signals and any size / theme change repaint everything.
+    pub fn render_incremental(&mut self, pm: &mut Pixmap, view: &PanelView) -> Damage {
+        let (w, h) = (pm.width(), pm.height());
+        if view.signal != Signal::Live {
+            self.incr = None;
+            self.render(pm, view);
+            return Damage::full(w, h);
+        }
+        let mut store = std::mem::take(&mut self.skia);
+        let d = {
+            let mut cv = store.canvas(pm);
+            self.render_live_incremental(&mut cv, w, h, view)
+        };
+        self.skia = store;
+        d
+    }
+
+    fn render_live_incremental(&mut self, cv: &mut dyn incr::RectCanvas, w: u32, h: u32, view: &PanelView) -> Damage {
+        let _p = profile::scope(Cat::Render);
+        if self.owner != Some(cv.instance_id()) {
+            self.stat = None;
+            self.dynlayer = None;
+            self.frozen = None;
+            self.incr = None;
+            self.owner = Some(cv.instance_id());
+        }
+        let s = scale_for(w);
+        let hd = design_height_for(w, h);
+        let ox = (w as f32 - WIDTH as f32 * s) / 2.0;
+        let oy = (h as f32 - hd * s) / 2.0;
+        cv.set_view(s, ox, oy);
+        let th = view.theme;
+        let lay = scene::Lay::new(hd);
+        let stat = self.ensure_static(cv, th, &lay, w, h);
+        let model = view.snapshot.and_then(|s| s.select(view.model));
+        let data = scene::Data { model, gpus: view.snapshot.map(|s| s.gpus_of(model)).unwrap_or_default() };
+        let frame = {
+            let _p = profile::scope(Cat::Record);
+            let mut rec = incr::Recorder::new((w, h), cv.view());
+            self.draw_dynamic(&mut rec, view, &data, &lay, true, view.t);
+            let _p = profile::scope(Cat::Overlay);
+            let right = self.title_right(view, &data);
+            rec.group();
+            scene::draw_centre_title(&mut rec, th, &self.fonts, &lay, &self.title_of(view, &data), right.as_deref());
+            rec.finish()
+        };
+        let rects = {
+            let _p = profile::scope(Cat::Diff);
+            self.incr
+                .take()
+                .filter(|(n, f)| *n == th.name && f.size() == (w, h))
+                .and_then(|(_, prev)| incr::diff(&prev, &frame))
+                .map(|r| incr::close_rects(r, &frame))
+        };
+        let _p = profile::scope(Cat::Replay);
+        let (damage, nops) = match rects {
+            None => {
+                cv.layer_copy_in(stat);
+                (Damage::full(w, h), incr::replay_all(cv, &self.fonts, &frame))
+            }
+            Some(rs) => {
+                let mut nops = 0;
+                let mut scratch = Vec::new();
+                for r in &rs {
+                    cv.layer_copy_rect(stat, r);
+                    nops += incr::replay_in(cv, &self.fonts, &frame, r, &mut scratch);
+                }
+                let rects = rs.iter().map(|r| Rect { x: r.x0 as u32, y: r.y0 as u32, w: (r.x1 - r.x0) as u32, h: (r.y1 - r.y0) as u32 }).collect();
+                (Damage { full: false, rects }, nops)
+            }
+        };
+        cv.set_view(1.0, 0.0, 0.0);
+        profile::damage(damage.area() as f64 / (w as f64 * h as f64).max(1.0), damage.rects.len(), nops, frame.op_count());
+        self.incr = Some((th.name, frame));
+        damage
+    }
+
     /// Backend-neutral entry point: renders a `w` x `h` frame into `cv`'s
     /// main target (see [`Renderer::render`] for the layout rules). Cached
     /// layers belong to one canvas instance ([`Canvas::instance_id`]).
@@ -135,6 +252,7 @@ impl Renderer {
             self.stat = None;
             self.dynlayer = None;
             self.frozen = None;
+            self.incr = None;
             self.owner = Some(cv.instance_id());
         }
         let s = scale_for(w);
@@ -315,6 +433,7 @@ impl Renderer {
         let u = lay.ut;
 
         // matrix rain behind everything, away from the label column
+        pm.group();
         {
             let _p = profile::scope(Cat::Rain);
             self.rain.draw(pm, th, c.x + 140.0, c.y + 46.0 * u, c.w - 150.0, c.h - 58.0 * u, t, 1.0);
@@ -322,6 +441,7 @@ impl Renderer {
 
         let m = d.model;
         let phase = m.map(|m| m.phase());
+        pm.group();
 
         if live {
             // GEN tok/s: ghost brightness when unknown, or 0 outside decode
@@ -357,6 +477,7 @@ impl Renderer {
         }
 
         // bottom strip: phase + TTFT, waveform
+        pm.group();
         let (ph_txt, ph_col) = match phase {
             Some(Phase::Idle) => ("IDLE", th.dim),
             Some(Phase::Prefill) => ("PREFILL", th.bright),
@@ -368,6 +489,7 @@ impl Renderer {
             .or_else(|| m.and_then(|m| m.current_request.as_ref()).and_then(|r| r.ttft_s));
         draw::text(pm, &f.semi, px(27.0, u, 18.0), c.x + 28.0, c.y + 246.0 * u, ph_txt, ph_col, 2.0, Align::Left);
         draw::text(pm, &f.label, px(14.0, u, 10.0), c.x + 28.0, c.y + 264.0 * u, &format!("TTFT  {}", fmt::secs(ttft)), th.text, 1.0, Align::Left);
+        pm.group();
         fx::draw_wave(pm, th, view.wave, view.wave_max, c.x + 230.0, c.y + 230.0 * u, c.w - 230.0 - 28.0, (34.0 * u).max(22.0), 1.0);
     }
 
@@ -535,5 +657,127 @@ mod layer_cache_tests {
                 assert!(a.data() == b.data(), "{w}x{h} {sig:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    /// A sequence of frames (changing snapshots, waves, time, sizes, themes
+    /// and signals): the incremental pixmap must equal a fresh full render
+    /// at every step, and most live frames must repaint only part of it.
+    #[test]
+    fn incremental_equals_full_over_a_sequence() {
+        let names = ["synthetic-v2-A", "synthetic-v2-C", "live-maya-decode", "synthetic-v2-B", "live-maya-idle", "synthetic-v2-D"];
+        let snaps: Vec<Snapshot> =
+            names.iter().map(|n| Snapshot::parse(&std::fs::read_to_string(format!("fixtures/{n}.json")).unwrap()).unwrap()).collect();
+        let themes = [crate::theme::theme("green").unwrap(), crate::theme::theme("blue").unwrap()];
+        let sel = ModelSelect::Auto;
+        let mut inc = Renderer::new();
+        let mut full = Renderer::new();
+        let mut pm: Option<Pixmap> = None;
+        let (mut partial, mut live_frames) = (0, 0);
+        let mut t = 0.0f32;
+        for step in 0..150usize {
+            t += 1.0 / 30.0;
+            let (w, h) = if step < 100 { (1920, 348) } else { (1920, 480) };
+            let snap = &snaps[(step / 9) % snaps.len()];
+            let th = &themes[usize::from(step >= 60 && step < 75)];
+            let n = 120 + (step % 5);
+            let wave: Vec<(f32, Option<f32>)> = (0..n)
+                .map(|i| (1.0 - i as f32 / (n - 1) as f32, if i % 37 == 5 { None } else { Some(40.0 + ((i + step) * 7 % 23) as f32) }))
+                .collect();
+            let cpu: Vec<(f32, Option<f32>)> = (0..15).map(|i| (1.0 - (i as f32 + t.fract()) / 15.0, Some(20.0 + ((i + step / 2) % 9) as f32 * 5.0))).collect();
+            let signal = if (30..34).contains(&step) { Signal::Stale { age_s: 3.0 } } else { Signal::Live };
+            let view = PanelView {
+                snapshot: Some(snap), model: &sel, signal: signal.clone(), theme: th, title: None,
+                wave: &wave, wave_max: Some(90.0), cpu_wave: &cpu, t,
+            };
+            if pm.as_ref().is_some_and(|p| (p.width(), p.height()) != (w, h)) {
+                pm = None;
+            }
+            let pm = pm.get_or_insert_with(|| Pixmap::new(w, h).unwrap());
+            let d = inc.render_incremental(pm, &view);
+            let mut reference = Pixmap::new(w, h).unwrap();
+            full.render(&mut reference, &view);
+            if pm.data() != reference.data() {
+                let (mut n, mut mx, mut first) = (0, 0i32, None);
+                for (i, (a, b)) in pm.data().iter().zip(reference.data()).enumerate() {
+                    if a != b {
+                        n += 1;
+                        mx = mx.max((*a as i32 - *b as i32).abs());
+                        first.get_or_insert((i / 4 % w as usize, i / 4 / w as usize));
+                    }
+                }
+                panic!("step {step}: incremental differs from full render: {n} bytes, max diff {mx}, first at {first:?}");
+            }
+            if signal == Signal::Live {
+                live_frames += 1;
+                if !d.full {
+                    partial += 1;
+                }
+            }
+        }
+        assert!(partial * 10 >= live_frames * 7, "only {partial} of {live_frames} live frames were partial");
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn dump_rects() {
+        let snap = Snapshot::parse(&std::fs::read_to_string(format!("fixtures/{}.json", std::env::var("FX").unwrap_or("live-maya-decode".into()))).unwrap()).unwrap();
+        let th = crate::theme::theme("green").unwrap();
+        let sel = ModelSelect::Auto;
+        let mut r = Renderer::new();
+        let mut pm = Pixmap::new(1920, 339).unwrap();
+        for i in 0..204 {
+            let wave: Vec<(f32, Option<f32>)> = (0..120).map(|k| (1.0 - k as f32 / 119.0, Some(50.0 + ((k + i) % 11) as f32))).collect();
+            let view = PanelView { snapshot: Some(&snap), model: &sel, signal: Signal::Live, theme: &th, title: None, wave: &wave, wave_max: Some(90.0), cpu_wave: &[], t: i as f32 / 30.0 };
+            let d = r.render_incremental(&mut pm, &view);
+            if i >= 2 && i < 4 {
+                println!("frame {i}: full {} area {:.1}%", d.full, 100.0 * d.area() as f64 / (1920.0 * 339.0));
+                for x in &d.rects { println!("  {:4},{:4} {:4}x{:4}", x.x, x.y, x.w, x.h); }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod incr_bench {
+    use super::*;
+
+    /// Full vs incremental render time (interleaved, so machine load cancels out).
+    #[test]
+    #[ignore]
+    fn bench_incremental() {
+        let fx = std::env::var("FX").unwrap_or("live-maya-decode".into());
+        let snap = Snapshot::parse(&std::fs::read_to_string(format!("fixtures/{fx}.json")).unwrap()).unwrap();
+        let th = crate::theme::theme("green").unwrap();
+        let sel = ModelSelect::Auto;
+        let (mut a, mut b) = (Renderer::new(), Renderer::new());
+        let (mut pa, mut pb) = (Pixmap::new(1920, 339).unwrap(), Pixmap::new(1920, 339).unwrap());
+        let (mut tf, mut ti, mut area) = (0.0f64, 0.0f64, 0.0f64);
+        let n = 300;
+        for i in 0..n * (if std::env::var_os("ONLY_INC").is_some() { 10 } else { 1 }) + 20 {
+            let t = i as f32 / 30.0;
+            let wave: Vec<(f32, Option<f32>)> = (0..120).map(|k| (1.0 - (k as f32 + t.fract()) / 120.0, Some(50.0 + ((k + i / 15) % 11) as f32))).collect();
+            let view = PanelView { snapshot: Some(&snap), model: &sel, signal: Signal::Live, theme: &th, title: None, wave: &wave, wave_max: Some(90.0), cpu_wave: &[], t };
+            let t0 = std::time::Instant::now();
+            if std::env::var_os("ONLY_INC").is_none() { a.render(&mut pa, &view); }
+            let d0 = t0.elapsed().as_secs_f64() * 1e3;
+            let t1 = std::time::Instant::now();
+            let d = b.render_incremental(&mut pb, &view);
+            let d1 = t1.elapsed().as_secs_f64() * 1e3;
+            if i >= 20 {
+                tf += d0;
+                ti += d1;
+                area += d.area() as f64 / (1920.0 * 339.0);
+            }
+        }
+        println!("full {:.3} ms, incremental {:.3} ms, area {:.1} %", tf / n as f64, ti / n as f64, 100.0 * area / n as f64);
     }
 }

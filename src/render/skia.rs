@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ab_glyph::{point, Font, PxScale, ScaleFont};
 use tiny_skia as sk;
 
+use super::incr::{IRect, RectCanvas};
 use super::canvas::{Canvas, Color, Cov, CovRow, FontFace, LayerFilter, LayerId, Path, Seg};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -17,6 +18,8 @@ pub struct SkiaStore {
     id: u64,
     view: (f32, f32, f32),
     layers: Vec<Option<sk::Pixmap>>,
+    /// Clip of the main target for text and coverage blits ([`RectCanvas::set_clip`]).
+    clip: Option<IRect>,
 }
 
 impl Default for SkiaStore {
@@ -27,7 +30,7 @@ impl Default for SkiaStore {
 
 impl SkiaStore {
     pub fn new() -> Self {
-        SkiaStore { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), view: (1.0, 0.0, 0.0), layers: Vec::new() }
+        SkiaStore { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), view: (1.0, 0.0, 0.0), layers: Vec::new(), clip: None }
     }
 
     /// Canvas drawing into `target` (the main surface).
@@ -88,6 +91,15 @@ impl SkiaCanvas<'_> {
             sk::Transform::identity()
         } else {
             sk::Transform::from_row(s, 0.0, 0.0, s, ox, oy)
+        }
+    }
+
+    /// Active clip rect `(x0, y0, x1, y1)` of the main target, if any.
+    fn clip_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        if self.stack.is_empty() {
+            self.st.clip.map(|r| (r.x0, r.y0, r.x1, r.y1))
+        } else {
+            None
         }
     }
 
@@ -158,6 +170,7 @@ impl Canvas for SkiaCanvas<'_> {
 
     fn text_run(&mut self, font: &FontFace, size: f32, x: f32, base_y: f32, s: &str, color: Color, tracking: f32) {
         let (vs, ox, oy) = self.st.view;
+        let (cx0, cy0, cx1, cy1) = self.clip_rect().unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
         let scale = PxScale::from(size * vs);
         let sc = font.as_scaled(scale);
         let (tracking, base_y) = (tracking * vs, base_y * vs + oy);
@@ -179,7 +192,7 @@ impl Canvas for SkiaCanvas<'_> {
                 let (bx, by) = (b.min.x as i32, b.min.y as i32);
                 og.draw(|gx, gy, cov| {
                     let (px, py) = (bx + gx as i32, by + gy as i32);
-                    if px >= 0 && py >= 0 && px < pw && py < ph {
+                    if px >= 0 && py >= 0 && px < pw && py < ph && px >= cx0 && px < cx1 && py >= cy0 && py < cy1 {
                         let i = ((py * pw + px) * 4) as usize;
                         blend_px(&mut data[i..i + 4], rgb, cov * ca);
                     }
@@ -191,6 +204,10 @@ impl Canvas for SkiaCanvas<'_> {
     }
 
     fn blit_cov(&mut self, cov: &Cov, x: i32, y: i32, rgb: [f32; 3], a: f32, clip: Option<(i32, i32, i32, i32)>) {
+        let clip = match (clip, self.clip_rect()) {
+            (Some(a), Some(b)) => Some((a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3))),
+            (a, b) => a.or(b),
+        };
         let pm = self.target();
         let (pw, ph) = (pm.width() as i32, pm.height() as i32);
         let (cx0, cy0, cx1, cy1) = clip.unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
@@ -216,11 +233,12 @@ impl Canvas for SkiaCanvas<'_> {
     }
 
     fn blit_cov_rows(&mut self, cov: &Cov, x: i32, rows: &[CovRow]) {
+        let (cx0, cy0, cx1, cy1) = self.clip_rect().unwrap_or((i32::MIN, i32::MIN, i32::MAX, i32::MAX));
         let pm = self.target();
         let (pw, ph) = (pm.width() as i32, pm.height() as i32);
         let data = pm.data_mut();
         for r in rows {
-            if r.a <= 0.0 || r.dst_y < 0 || r.dst_y >= ph {
+            if r.a <= 0.0 || r.dst_y < 0 || r.dst_y >= ph || r.dst_y < cy0 || r.dst_y >= cy1 {
                 continue;
             }
             for col in 0..cov.w {
@@ -229,7 +247,7 @@ impl Canvas for SkiaCanvas<'_> {
                     continue;
                 }
                 let px = x + col as i32;
-                if px < 0 || px >= pw {
+                if px < 0 || px >= pw || px < cx0 || px >= cx1 {
                     continue;
                 }
                 let i = ((r.dst_y * pw + px) * 4) as usize;
@@ -295,5 +313,67 @@ impl Canvas for SkiaCanvas<'_> {
                 }
             }
         }
+    }
+}
+
+impl RectCanvas for SkiaCanvas<'_> {
+    fn set_clip(&mut self, r: Option<&IRect>) {
+        self.st.clip = r.copied();
+    }
+
+    fn save_rect(&mut self, r: &IRect, buf: &mut Vec<u8>) {
+        let pm = self.target();
+        let (w, h) = (pm.width() as i32, pm.height() as i32);
+        let (x0, x1, y0, y1) = (r.x0.clamp(0, w) as usize, r.x1.clamp(0, w) as usize, r.y0.clamp(0, h) as usize, r.y1.clamp(0, h) as usize);
+        buf.clear();
+        if x1 <= x0 {
+            return;
+        }
+        let w = w as usize;
+        for y in y0..y1 {
+            buf.extend_from_slice(&pm.data()[(y * w + x0) * 4..(y * w + x1) * 4]);
+        }
+    }
+
+    fn restore_outside(&mut self, r: &IRect, buf: &[u8], keep: &IRect) {
+        let pm = self.target();
+        let (w, h) = (pm.width() as i32, pm.height() as i32);
+        let (x0, x1, y0, y1) = (r.x0.clamp(0, w), r.x1.clamp(0, w), r.y0.clamp(0, h), r.y1.clamp(0, h));
+        if x1 <= x0 {
+            return;
+        }
+        let rw = (x1 - x0) as usize;
+        let data = pm.data_mut();
+        let mut put = |y: i32, a: i32, b: i32| {
+            if b > a {
+                let s = ((y - y0) as usize * rw + (a - x0) as usize) * 4;
+                let d = (y as usize * w as usize + a as usize) * 4;
+                let n = (b - a) as usize * 4;
+                data[d..d + n].copy_from_slice(&buf[s..s + n]);
+            }
+        };
+        for y in y0..y1 {
+            if y < keep.y0 || y >= keep.y1 {
+                put(y, x0, x1);
+            } else {
+                put(y, x0, keep.x0.clamp(x0, x1));
+                put(y, keep.x1.clamp(x0, x1), x1);
+            }
+        }
+    }
+
+    fn layer_copy_rect(&mut self, id: LayerId, r: &IRect) {
+        let src = self.st.layers[id.0 as usize].take().expect("live layer");
+        let dst = self.target();
+        let w = dst.width() as usize;
+        let (x0, x1) = (r.x0.max(0) as usize * 4, (r.x1.max(0) as usize).min(w) * 4);
+        let (y0, y1) = (r.y0.max(0) as usize, (r.y1.max(0) as usize).min(dst.height() as usize));
+        if x1 > x0 {
+            let (sd, dd) = (src.data(), dst.data_mut());
+            for y in y0..y1 {
+                dd[y * w * 4 + x0..y * w * 4 + x1].copy_from_slice(&sd[y * w * 4 + x0..y * w * 4 + x1]);
+            }
+        }
+        self.st.layers[id.0 as usize] = Some(src);
     }
 }
