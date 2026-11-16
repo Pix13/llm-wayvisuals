@@ -1,14 +1,31 @@
 # llm-wayvisuals
 
-Sci-fi 1920x480 "sensor panel" displays for LLM inference stats. Up to three
-panels, one per screen, each fed by one
-[llm-visuals](https://github.com/DingoOz/llm-visuals) instance (local file,
-Unix socket, or remote HTTP). Linux only; works on Wayland (GNOME, KDE, sway,
-Hyprland, ...) and on X11. CPU rendering, no GPU needed.
+Sci-fi 1920x480 "sensor panel" displays for LLM inference servers, fed by the
+live stats export of [llm-visuals](https://github.com/DingoOz/llm-visuals).
+Linux only; works on Wayland (GNOME, KDE, sway, Hyprland, ...) and on X11.
+CPU rendering, no GPU needed on the display machine.
 
-Shown: Gen and Prefill tok/s, model, engine, context, phase, session tokens,
-GPU use, last request. A panel without fresh data shows NO SIGNAL, never old
-values.
+![Two inference servers stacked in one window](docs/media/demo.gif)
+
+<sub>Two servers in one window: a DeepSeek MoE on 2x RTX 3090 limited by RAM
+bandwidth (experts on the CPU lane), and a Qwen model on a V100 limited by
+PCIe. Full capture: [docs/media/capture.mp4](docs/media/capture.mp4) ·
+still: [docs/media/screenshot.png](docs/media/screenshot.png).</sub>
+
+Each panel shows:
+
+- **Generation and prefill rates** in large digits, phase, TTFT, and a
+  decode-rate curve.
+- **Data path**: SSD → CPU/RAM → up to 4 GPUs, with live throughput on every
+  link (disk, RAM weight stream, PCIe per GPU). The link that holds the model
+  back glows red, using llm-visuals' own bottleneck verdict.
+- **GPU**: aggregate utilisation, clock, power and VRAM across the model's
+  GPUs, plus one line per GPU.
+- **CPU**: host load over the last 15 s, and the inference process load
+  normalised over the engine's compute threads.
+- Memory/VRAM, context fill, temperatures, power, and the last request.
+
+A panel without fresh data shows NO SIGNAL, never old values as current ones.
 
 ## Build
 
@@ -91,9 +108,10 @@ without a display), `bench-render`.
 
 ## Exporter (llm-visuals)
 
-This client lives in the llm-visuals repository (`clients/llm-wayvisuals/`)
-and reads the exporter built from the repository root. It runs as a headless
-daemon:
+The panels read the live export added to llm-visuals in
+[Pix13/llm-visuals, branch `feature/live-export`](https://github.com/Pix13/llm-visuals/tree/feature/live-export)
+(proposed upstream). With an export flag, llm-visuals runs as a headless
+daemon next to the inference server:
 
 ```
 llm-visuals --export-json /run/user/1000/llmv-0.json          # file
@@ -103,6 +121,16 @@ llm-visuals --export-listen 0.0.0.0:9464 --export-token-file ~/.t   # HTTP + tok
 llm-visuals --demo --export-json /tmp/demo.json               # no GPU needed
 ```
 
-A systemd user unit for the daemon is in `contrib/systemd/` at the
-repository root. The JSON schema (`llm-visuals.stats/1`) is described in
-`docs/export-schema.md`.
+That branch also has a systemd user unit (`contrib/systemd/`) and the JSON
+schema (`llm-visuals.stats/1`, `docs/export-schema.md`).
+
+## Demo without a GPU
+
+`tools/demo3.sh` starts three `llm-visuals --demo` daemons and shows them in
+one window (it needs `llm-visuals` from the branch above in `PATH`, or set
+`LLM_VISUALS=/path/to/llm-visuals`).
+
+## License
+
+MIT (see [LICENSE](LICENSE)). Fonts: Rajdhani and Oxanium, SIL Open Font
+License 1.1 (`assets/fonts/*/OFL.txt`).

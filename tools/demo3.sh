@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 2 acceptance demo: 3 headless llm-visuals --demo daemons, 3 panels.
+# Demo: 3 headless llm-visuals --demo daemons, 3 panels.
 # Usage: bash tools/demo3.sh [--window | output names...]
 #   bash tools/demo3.sh                 # ONE window with the 3 panels stacked (default, safe on a desktop)
 #   bash tools/demo3.sh DP-2 DP-3 HDMI-1  # fullscreen, one panel per output (3 surfaces)
@@ -9,10 +9,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-LV=../../target/release/llm-visuals
+# llm-visuals with the live export (github.com/Pix13/llm-visuals, branch
+# feature/live-export): from $LLM_VISUALS, else from PATH.
+LV="${LLM_VISUALS:-$(command -v llm-visuals || true)}"
+if [ -z "$LV" ] || ! "$LV" --help 2>/dev/null | grep -q -- --export-json; then
+  echo "demo3: llm-visuals with --export-json not found; set LLM_VISUALS=/path/to/llm-visuals" >&2
+  exit 1
+fi
 APP=target/release/llm-wayvisuals
 # Always rebuild (a stale binary would show old behaviour); no-op when up to date.
-(cd ../.. && cargo build --release -q)
 cargo build --release -q
 
 RUN="${XDG_RUNTIME_DIR:-/tmp}/llm-wayvisuals-demo"
