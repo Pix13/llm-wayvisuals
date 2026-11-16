@@ -80,6 +80,10 @@ pub struct Renderer {
     frozen_size: (u32, u32),
     gen_mask: Option<(String, Mask)>,
     pre_mask: Option<(String, Mask)>,
+    /// Highest GEN / PREFILL values seen by this renderer (fallback when the
+    /// export gives no session peak).
+    seen_gen_max: f64,
+    seen_pre_max: f64,
     /// Recorded dynamic content of the previous live frame ([`Renderer::render_incremental`]).
     incr: Option<(&'static str, incr::Frame)>,
 }
@@ -144,7 +148,7 @@ impl Renderer {
         let fonts = Fonts::load();
         let rain = Rain::new(&fonts.label);
         let dm = fx::digit_metrics(&fonts.digits);
-        Renderer { fonts, rain, dm, skia: SkiaStore::new(), owner: None, stat: None, dynlayer: None, frozen: None, frozen_size: (0, 0), gen_mask: None, pre_mask: None, incr: None }
+        Renderer { fonts, rain, dm, skia: SkiaStore::new(), owner: None, stat: None, dynlayer: None, frozen: None, frozen_size: (0, 0), gen_mask: None, pre_mask: None, seen_gen_max: 0.0, seen_pre_max: 0.0, incr: None }
     }
 
     /// Renders into `pm`, filling it, natively at any size. All geometry
@@ -472,7 +476,7 @@ impl Renderer {
             };
             let vs = pm.view().0;
             let gm = Self::mask(&mut self.gen_mask, f, self.dm, &gen_s, gen_ghost, 76.0 * u * vs);
-            let cx = c.x + 376.0;
+            let cx = c.x + 346.0;
             let right = draw::tx(pm, cx) + gm.w as f32 / 2.0;
             let base = c.y + 128.0 * u;
             let top = mix(th.accent, Color::WHITE, 0.5);
@@ -481,6 +485,18 @@ impl Renderer {
             fx::draw_digits(pm, &gm, gx, gy, top, bot, th.accent, (22.0 * u * vs) as usize, 1.0);
             draw::text(pm, &f.semi, px(30.0, u, 20.0), c.x + 28.0, base - 30.0 * u, "GEN", th.value, 2.0, Align::Left);
             draw::text(pm, &f.label, px(14.0, u, 10.0), c.x + 28.0, base - 10.0 * u, "TOK/S", th.dim, 2.0, Align::Left);
+            // MAX blocks: max of the export session peak and the highest value this renderer has seen (0 = unknown, shown as --)
+            let known = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+            if let Some(v) = known(gv) {
+                self.seen_gen_max = self.seen_gen_max.max(v);
+            }
+            if let Some(v) = known(m.and_then(|m| m.display_prefill_tps())) {
+                self.seen_pre_max = self.seen_pre_max.max(v);
+            }
+            let gmax = known(Some(self.seen_gen_max.max(m.and_then(|m| m.peak_decode_tps).unwrap_or(0.0))));
+            let pmax = known(Some(self.seen_pre_max.max(m.and_then(|m| m.peak_prefill_tps).unwrap_or(0.0))));
+            let mx = (cx + gm.w as f32 / 2.0 / vs + 14.0 * u).min(c.x + c.w - 96.0 * u);
+            Self::draw_max(pm, f, th, mx, base - 76.0 * u, u, gmax, 24.0);
 
             // PREFILL tok/s: same style, ~55 % height, same right edge
             let pv = m.and_then(|m| m.display_prefill_tps());
@@ -492,6 +508,7 @@ impl Renderer {
             fx::draw_digits(pm, &pmk, (right - pmk.w as f32) as i32, py, top, bot, th.accent, (14.0 * u * vs) as usize, 1.0);
             draw::text(pm, &f.semi, px(20.0, u, 14.0), c.x + 28.0, base2 - 16.0 * u, "PREFILL", th.value, 1.5, Align::Left);
             draw::text(pm, &f.label, px(12.0, u, 10.0), c.x + 28.0, base2, "TOK/S", th.dim, 2.0, Align::Left);
+            Self::draw_max(pm, f, th, mx, base2 - 42.0 * u, u, pmax, 18.0);
         }
 
         // bottom strip: phase + TTFT, waveform
@@ -509,6 +526,19 @@ impl Renderer {
         draw::text(pm, &f.label, px(14.0, u, 10.0), c.x + 28.0, c.y + 264.0 * u, &format!("TTFT  {}", fmt::secs(ttft)), th.text, 1.0, Align::Left);
         pm.group();
         fx::draw_wave(pm, th, view.wave, view.wave_max, c.x + 230.0, c.y + 230.0 * u, c.w - 230.0 - 28.0, (34.0 * u).max(22.0), 1.0);
+    }
+
+    /// Small "MAX" label with the value below it (ghost colour). `top` is the
+    /// top of the block in design units scaled by `u`; `vsize` is the value
+    /// size in design px.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_max(pm: &mut dyn Canvas, f: &Fonts, th: &Theme, x: f32, top: f32, u: f32, v: Option<f64>, vsize: f32) {
+        use scene::px;
+        let ls = px(11.0, u, 8.0);
+        draw::text(pm, &f.label, ls, x, top + ls, "MAX", th.dim, 2.0, Align::Left);
+        let vs = px(vsize, u, 12.0);
+        let s = if v.is_some() { fmt::big_tps(v) } else { fmt::NONE.to_string() };
+        draw::text(pm, &f.digits, vs, x, top + ls + 4.0 * u + vs, &s, alpha(th.accent, 0.5), 1.0, Align::Left);
     }
 
     fn draw_no_signal(&mut self, pm: &mut dyn Canvas, view: &PanelView, lay: &scene::Lay) {

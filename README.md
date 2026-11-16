@@ -14,7 +14,9 @@ still: [docs/media/screenshot.png](docs/media/screenshot.png).</sub>
 
 Each panel shows:
 
-- **Generation and prefill rates** in large digits, phase, TTFT, and a
+- **Generation and prefill rates** in large digits, each with a small MAX
+  block on its right (session peak from the export, or the highest value seen
+  by this client since start when the export has none), phase, TTFT, and a
   decode-rate curve.
 - **Data path**: SSD → CPU/RAM → up to 4 GPUs, with live throughput on every
   link (disk, RAM weight stream, PCIe per GPU). The link that holds the model
